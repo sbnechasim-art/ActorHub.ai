@@ -1,0 +1,80 @@
+groups:
+  - name: actorhub
+    rules:
+      # API Down
+      - alert: APIDown
+        expr: up{job="actorhub-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "ActorHub API is down"
+          description: "The API has been down for more than 1 minute"
+
+      # High Response Time
+      - alert: HighResponseTime
+        expr: http_request_duration_seconds{quantile="0.95"} > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High API response time"
+          description: "95th percentile response time is above 1 second"
+
+      # High Error Rate
+      - alert: HighErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High error rate"
+          description: "More than 5% of requests are failing"
+
+      # Database Connection Issues
+      - alert: DatabaseDown
+        expr: pg_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PostgreSQL is down"
+
+      # Redis Down
+      - alert: RedisDown
+        expr: redis_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis is down"
+
+      # High Memory Usage
+      - alert: HighMemoryUsage
+        expr: (node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage"
+          description: "Memory usage is above 90%"
+
+      # Disk Space Low
+      - alert: DiskSpaceLow
+        expr: node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"} < 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Disk space low"
+          description: "Less than 10% disk space remaining"
+
+      # Rate Limiting Too Many Blocks
+      - alert: TooManyRateLimits
+        expr: increase(http_requests_total{status="429"}[5m]) > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Excessive rate limiting"
+          description: "More than 1000 requests blocked in 5 minutes"

@@ -1,0 +1,231 @@
+# ActorHub Production Docker Compose
+# For production deployment
+
+version: '3.8'
+
+services:
+  # ===========================================
+  # API Service
+  # ===========================================
+  api:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+    container_name: actorhub-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:${DB_PASSWORD}@postgres:5432/actorhub
+      - REDIS_URL=redis://redis:6379/0
+      - S3_ENDPOINT=http://minio:9000
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - ENVIRONMENT=production
+      - SECRET_KEY=${SECRET_KEY}
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
+      - REPLICATE_API_TOKEN=${REPLICATE_API_TOKEN}
+      - SENTRY_DSN=${SENTRY_DSN}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      qdrant:
+        condition: service_started
+    networks:
+      - actorhub-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # ===========================================
+  # Web Frontend
+  # ===========================================
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_API_URL=https://api.actorhub.ai
+        - NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=${STRIPE_PUBLISHABLE_KEY}
+    container_name: actorhub-web
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+    networks:
+      - actorhub-network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+
+  # ===========================================
+  # Celery Worker
+  # ===========================================
+  worker:
+    build:
+      context: ./apps/worker
+      dockerfile: Dockerfile
+    container_name: actorhub-worker
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:${DB_PASSWORD}@postgres:5432/actorhub
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - S3_ENDPOINT=http://minio:9000
+      - QDRANT_HOST=qdrant
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
+      - REPLICATE_API_TOKEN=${REPLICATE_API_TOKEN}
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - actorhub-network
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+
+  # ===========================================
+  # Celery Beat (Scheduler)
+  # ===========================================
+  beat:
+    build:
+      context: ./apps/worker
+      dockerfile: Dockerfile
+    container_name: actorhub-beat
+    restart: unless-stopped
+    command: celery -A celery_app beat --loglevel=info
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+    depends_on:
+      - redis
+    networks:
+      - actorhub-network
+
+  # ===========================================
+  # PostgreSQL
+  # ===========================================
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: actorhub-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: actorhub
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - actorhub-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ===========================================
+  # Redis
+  # ===========================================
+  redis:
+    image: redis:7-alpine
+    container_name: actorhub-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - actorhub-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ===========================================
+  # MinIO (S3-compatible storage)
+  # ===========================================
+  minio:
+    image: minio/minio:latest
+    container_name: actorhub-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      - actorhub-network
+
+  # ===========================================
+  # Qdrant (Vector Database)
+  # ===========================================
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: actorhub-qdrant
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - actorhub-network
+
+  # ===========================================
+  # Nginx (Reverse Proxy)
+  # ===========================================
+  nginx:
+    image: nginx:alpine
+    container_name: actorhub-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+    depends_on:
+      - api
+      - web
+    networks:
+      - actorhub-network
+
+networks:
+  actorhub-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  qdrant_data:

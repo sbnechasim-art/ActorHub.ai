@@ -1,0 +1,205 @@
+ 🚀 הפעלת הפלטפורמה מהטרמינל
+
+  שלב 1: הפעלת Infrastructure (Docker)
+
+  # פתח טרמינל בתיקיית הפרויקט
+  cd "C:\ActorHub.ai 1.1"
+
+  # הפעל את כל השירותים (PostgreSQL, Redis, MinIO, Qdrant)
+  docker-compose up -d
+
+  # וודא שהכל רץ
+  docker-compose ps
+
+  שירותים שירוצו:
+  | שירות      | פורט       | URL                             |
+  |------------|------------|---------------------------------|
+  | PostgreSQL | 5433       | localhost:5433                  |
+  | Redis      | 6380       | localhost:6380                  |
+  | MinIO (S3) | 9000, 9001 | http://localhost:9001 (console) |
+  | Qdrant     | 6333       | http://localhost:6333           |
+
+  ---
+  שלב 2: הפעלת Backend API
+
+  # פתח טרמינל חדש
+  cd "C:\ActorHub.ai 1.1\apps\api"
+
+  # הפעל virtual environment (אם יש)
+  .\venv\Scripts\activate
+
+  # הרץ מיגרציות
+  python -m alembic upgrade head
+
+  # הפעל את ה-API
+  python -m uvicorn app.main:app --reload --port 8000
+
+  API יהיה זמין ב:
+  - API: http://localhost:8000
+  - Docs: http://localhost:8000/docs
+  - Health: http://localhost:8000/health
+
+  ---
+  שלב 3: הפעלת Frontend
+
+  # פתח טרמינל חדש
+  cd "C:\ActorHub.ai 1.1\apps\web"
+
+  # התקן dependencies (פעם ראשונה)
+  pnpm install
+
+  # הפעל development server
+  pnpm dev
+
+  Frontend יהיה זמין ב: http://localhost:3000
+
+  ---
+  שלב 4: הפעלת Worker (Celery) - אופציונלי
+
+  # פתח טרמינל חדש
+  cd "C:\ActorHub.ai 1.1\apps\worker"
+
+  # הפעל את ה-worker
+  celery -A celery_app worker --loglevel=info
+
+  ---
+  ⚡ קיצורי דרך (מתיקיית הפרויקט הראשית)
+
+  # הפעל הכל במכה אחת
+  docker-compose up -d && cd apps/api && python -m uvicorn app.main:app --reload --port 8000
+
+  # או השתמש בסקריפטים של package.json
+  pnpm docker:up          # Docker infrastructure
+  pnpm dev:api            # Backend API
+  pnpm dev:web            # Frontend
+  pnpm db:migrate         # Database migrations
+
+  ---
+  🔍 בדיקה שהכל עובד
+
+  # בדוק health
+  curl http://localhost:8000/health
+
+  # בדוק health מפורט (כולל כל השירותים)
+  curl http://localhost:8000/api/v1/health/detailed
+
+  # בדוק את ה-API docs
+  start http://localhost:8000/docs
+
+  ---
+  📋 סדר הפעלה מלא (copy-paste)
+
+  # טרמינל 1 - Infrastructure
+  cd "C:\ActorHub.ai 1.1"
+  docker-compose up -d
+  docker-compose ps
+
+  # טרמינל 2 - API
+  cd "C:\ActorHub.ai 1.1\apps\api"
+  .\venv\Scripts\activate
+  python -m alembic upgrade head
+  python -m uvicorn app.main:app --reload --port 8000
+
+  # טרמינל 3 - Frontend
+  cd "C:\ActorHub.ai 1.1\apps\web"
+  pnpm dev
+
+  ---
+  URLs לאחר הפעלה:
+  | שירות               | URL                             |
+  |---------------------|---------------------------------|
+  | 🌐 Frontend         | http://localhost:3000           |
+  | 🔧 API              | http://localhost:8000           |
+  | 📖 API Docs         | http://localhost:8000/docs      |
+  | 💾 MinIO Console    | http://localhost:9001           |
+  | 🔍 Qdrant Dashboard | http://localhost:6333/dashboard |
+
+> יש דשבורד ניהולי ?
+
+● Search(pattern: "**/*admin*", path: "apps\web\src")
+  ⎿  Found 0 files
+
+● Search(pattern: "**/admin/**/*.tsx", path: "apps\web\src")
+  ⎿  Found 1 file (ctrl+o to expand)
+
+● Read(apps\api\app\api\v1\endpoints\admin.py)
+  ⎿  Read 525 lines
+
+● Read(apps\web\src\app\(admin)\admin\page.tsx)
+  ⎿  Read 357 lines
+
+● Search(pattern: "**/app/**/admin/**/*", path: "apps\web\src")
+  ⎿  Found 1 file (ctrl+o to expand)
+
+● כן! יש דשבורד ניהולי 🎛️
+
+  סטטוס נוכחי
+
+  | רכיב        | מצב     | הערות                        |
+  |-------------|---------|------------------------------|
+  | Backend API | ✅ מלא  | /api/v1/admin/*              |
+  | Frontend UI | ⚠️ חלקי | עובד עם mock data            |
+  | חיבור API   | 🔴 חסר  | צריך לחבר frontend ל-backend |
+
+  ---
+  Backend Admin API (/api/v1/admin/*)
+
+  | Endpoint                   | תיאור                    |
+  |----------------------------|--------------------------|
+  | GET /dashboard             | סטטיסטיקות כלליות        |
+  | GET /users                 | רשימת משתמשים עם פילטרים |
+  | GET /users/{id}            | פרטי משתמש מלאים         |
+  | PATCH /users/{id}          | עדכון role/tier/status   |
+  | GET /audit-logs            | לוגי ביקורת              |
+  | GET /webhooks              | אירועי webhook           |
+  | POST /webhooks/{id}/retry  | שליחה חוזרת של webhook   |
+  | GET /payouts/pending       | תשלומים ממתינים          |
+  | POST /payouts/{id}/approve | אישור תשלום              |
+
+  הגנה: רק משתמשים עם role=ADMIN יכולים לגשת
+
+  ---
+  Frontend Admin UI
+
+  נגיש ב: http://localhost:3000/admin
+
+  מה יש:
+  - ✅ Overview עם סטטיסטיקות
+  - ✅ ניהול משתמשים
+  - ✅ מודרציית תוכן
+  - ✅ עיצוב מוכן
+
+  מה חסר:
+  - 🔴 חיבור ל-API אמיתי (כרגע mock data)
+  - 🔴 ניהול payouts
+  - 🔴 ניהול webhooks
+
+  ---
+  איך להפעיל
+
+  # 1. צור משתמש admin בבסיס הנתונים
+  cd "C:\ActorHub.ai 1.1\apps\api"
+  python -c "
+  import asyncio
+  from sqlalchemy import update
+  from app.core.database import async_session_maker
+  from app.models.user import User, UserRole
+
+  async def make_admin(email):
+      async with async_session_maker() as db:
+          await db.execute(
+              update(User).where(User.email == email).values(role=UserRole.ADMIN)
+          )
+          await db.commit()
+          print(f'User {email} is now ADMIN')
+
+  asyncio.run(make_admin('your-email@example.com'))
+  "
+
+  # 2. גש לדשבורד
+  start http://localhost:3000/admin
+
+  ---
+  צריך לחבר את ה-Frontend ל-Backend?
+
+  כרגע הדשבורד עובד עם mock data. אני יכול לחבר אותו ל-API האמיתי אם תרצה.
