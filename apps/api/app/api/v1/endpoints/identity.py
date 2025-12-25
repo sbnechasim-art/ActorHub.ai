@@ -3,31 +3,43 @@ Identity API Endpoints
 Core functionality for identity registration and verification
 """
 
+import json
 import time
+import traceback
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
+import structlog
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
+from app.core.helpers import utc_now  # MEDIUM FIX: Use timezone-aware datetime
 from app.core.database import get_db
 from app.core.security import get_api_key, get_current_user
-from app.models.identity import Identity, IdentityStatus, ProtectionLevel, UsageLog
+from app.models.identity import ActorPack, Identity, IdentityStatus, ProtectionLevel, UsageLog
 from app.models.user import ApiKey, User
 from app.schemas.identity import (
+    IdentityListResponse,
     IdentityResponse,
     IdentityUpdate,
+    LivenessMetadata,
     VerifyRequest,
     VerifyResponse,
     VerifyResult,
 )
+from app.schemas.response import PaginationMeta
+from app.core.helpers import get_or_404, check_ownership, get_owned_or_404
+from sqlalchemy import func
 from app.services.face_recognition import FaceRecognitionService
 from app.services.storage import StorageService
+from app.services.listing import ListingService
 
+logger = structlog.get_logger()
 router = APIRouter()
 
 # Initialize services
@@ -38,15 +50,17 @@ storage_service = StorageService()
 ALLOWED_IMAGE_DOMAINS = set(settings.ALLOWED_IMAGE_DOMAINS)
 
 
-@router.post("/register", response_model=IdentityResponse)
+@router.post("/register", response_model=IdentityResponse, status_code=status.HTTP_201_CREATED)
 async def register_identity(
     display_name: str = Form(..., description="Display name for the identity"),
     protection_level: str = Form("free", description="Protection level: free, pro, enterprise"),
     allow_commercial: bool = Form(False, description="Allow commercial use"),
     allow_ai_training: bool = Form(False, description="Allow AI training"),
+    show_in_public_gallery: bool = Form(False, description="Show in public gallery"),
     face_image: UploadFile = File(..., description="Primary face photo"),
     verification_image: UploadFile = File(..., description="Verification selfie"),
-    background_tasks: BackgroundTasks = None,
+    is_live_capture: str = Form("false", description="Whether selfie was captured live from camera"),
+    liveness_metadata: Optional[str] = Form(None, description="JSON metadata from live capture"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -55,32 +69,79 @@ async def register_identity(
 
     **Requirements:**
     - Primary face photo (front-facing, good lighting)
-    - Verification selfie (for liveness check)
+    - Verification selfie (for liveness check) - preferably live camera capture
 
-    **Returns:** Identity record with protection status
+    **Returns:** 201 Created with identity record and protection status.
+
+    **Errors:**
+    - 400: Invalid image, no face detected, face verification failed, or stale capture
+    - 401: Unauthorized
+    - 422: Validation error
     """
-    import structlog
-    logger = structlog.get_logger()
+    # Bind user context for all logs in this request
+    bound_logger = logger.bind(
+        user_id=str(current_user.id),
+        endpoint="identity.register"
+    )
 
-    logger.info(f"Starting identity registration for user {current_user.id}")
-    logger.info(f"Display name: {display_name}, Protection level: {protection_level}")
+    bound_logger.info(
+        "Starting identity registration",
+        display_name=display_name,
+        protection_level=protection_level
+    )
+
+    # Parse and validate liveness metadata if provided
+    parsed_liveness: Optional[LivenessMetadata] = None
+    is_live = is_live_capture.lower() == "true"
+
+    if is_live and liveness_metadata:
+        try:
+            liveness_data = json.loads(liveness_metadata)
+            parsed_liveness = LivenessMetadata(**liveness_data)
+
+            # Validate timestamp freshness (within 60 seconds to allow for processing)
+            if not parsed_liveness.is_fresh(max_age_seconds=60):
+                bound_logger.warning("Selfie capture is too old", capture_timestamp=parsed_liveness.capture_timestamp)
+                raise HTTPException(
+                    400,
+                    "Selfie capture has expired. Please take a new selfie."
+                )
+
+            bound_logger.info(
+                "Liveness metadata validated",
+                device_type=parsed_liveness.device_type,
+                frame_count=parsed_liveness.frame_count,
+                capture_age_ms=int(utc_now().timestamp() * 1000) - parsed_liveness.capture_timestamp
+            )
+        except json.JSONDecodeError:
+            bound_logger.warning("Invalid liveness metadata JSON")
+            raise HTTPException(400, "Invalid liveness metadata format")
+        except Exception as e:
+            if isinstance(e, HTTPException):
+                raise
+            bound_logger.warning("Failed to parse liveness metadata", error=str(e))
+            # Continue without liveness metadata if parsing fails
 
     # Read images
     try:
         face_bytes = await face_image.read()
         verification_bytes = await verification_image.read()
     except Exception as e:
-        logger.error(f"Failed to read uploaded images: {str(e)}")
+        bound_logger.error("Failed to read uploaded images", error=str(e))
         raise HTTPException(400, "Failed to read uploaded images")
 
-    logger.info(f"Face image size: {len(face_bytes)} bytes, Verification image size: {len(verification_bytes)} bytes")
+    bound_logger.info(
+        "Images received",
+        face_image_size=len(face_bytes),
+        verification_image_size=len(verification_bytes)
+    )
 
     # Validate image sizes
     if len(face_bytes) > 10 * 1024 * 1024:  # 10MB limit
-        logger.warning("Face image too large")
+        bound_logger.warning("Face image too large", size=len(face_bytes))
         raise HTTPException(400, "Face image too large (max 10MB)")
     if len(verification_bytes) > 10 * 1024 * 1024:
-        logger.warning("Verification image too large")
+        bound_logger.warning("Verification image too large", size=len(verification_bytes))
         raise HTTPException(400, "Verification image too large (max 10MB)")
 
     # Validate image MIME types (check magic bytes)
@@ -123,6 +184,31 @@ async def register_identity(
             400, "Liveness check failed. Please take a new selfie with good lighting."
         )
 
+    # CRITICAL SECURITY CHECK: Verify face_image and verification_image are the SAME person
+    # This prevents attackers from registering someone else's face with their own selfie
+    verification_embedding = await face_service.extract_embedding(verification_bytes)
+    if verification_embedding is None:
+        raise HTTPException(
+            400, "Could not detect face in verification selfie. Please use a clear, front-facing photo."
+        )
+
+    # Compare face embeddings using the service (handles mock mode properly)
+    is_match, face_similarity = await face_service.compare_faces(
+        embedding, verification_embedding, settings.FACE_SIMILARITY_THRESHOLD
+    )
+
+    if not is_match:
+        logger.warning(
+            f"Face verification FAILED: similarity {face_similarity:.3f} < threshold {settings.FACE_SIMILARITY_THRESHOLD}"
+        )
+        raise HTTPException(
+            400,
+            "Face verification failed. The face in your photo does not match your verification selfie. "
+            "Please ensure both images show the same person."
+        )
+
+    logger.info(f"Face verification PASSED: similarity {face_similarity:.3f}")
+
     # Check for duplicates
     similar = await face_service.find_similar(
         embedding, threshold=settings.FACE_DUPLICATE_THRESHOLD
@@ -131,6 +217,36 @@ async def register_identity(
         raise HTTPException(
             409, "This face is already registered. If this is your face, please contact support."
         )
+
+    # Clean up soft-deleted identities with same name (hard delete)
+    from sqlalchemy import select, delete
+    from app.models.marketplace import Listing
+    from app.models.identity import UsageLog
+
+    deleted_identity_result = await db.execute(
+        select(Identity).where(
+            Identity.user_id == current_user.id,
+            Identity.display_name == display_name.strip(),
+            Identity.deleted_at.isnot(None)
+        )
+    )
+    deleted_identities = deleted_identity_result.scalars().all()
+
+    for deleted_identity in deleted_identities:
+        bound_logger.info(
+            "Cleaning up soft-deleted identity with same name",
+            deleted_identity_id=str(deleted_identity.id),
+            display_name=display_name
+        )
+        # Delete related records first
+        await db.execute(delete(UsageLog).where(UsageLog.identity_id == deleted_identity.id))
+        await db.execute(delete(Listing).where(Listing.identity_id == deleted_identity.id))
+        await db.execute(delete(ActorPack).where(ActorPack.identity_id == deleted_identity.id))
+        await db.delete(deleted_identity)
+
+    if deleted_identities:
+        await db.flush()
+        bound_logger.info(f"Cleaned up {len(deleted_identities)} soft-deleted identities")
 
     # Upload images to storage
     file_uuid = uuid.uuid4()
@@ -146,19 +262,27 @@ async def register_identity(
         user_id=current_user.id,
         display_name=display_name,
         profile_image_url=face_image_url,
-        status=IdentityStatus.PROCESSING,
-        protection_level=ProtectionLevel(protection_level),
+        status="PROCESSING",
+        protection_level=protection_level.upper(),  # Store as string
         allow_commercial_use=allow_commercial,
         allow_ai_training=allow_ai_training,
+        show_in_public_gallery=show_in_public_gallery,
     )
     db.add(identity)
     await db.flush()
 
     # Update identity status (embedding stored in Qdrant, not DB)
     # Note: face_embedding column skipped due to pgvector/asyncpg compatibility issue
-    identity.status = IdentityStatus.VERIFIED
-    identity.verified_at = datetime.utcnow()
-    identity.verification_method = "selfie"
+    identity.status = "VERIFIED"
+    identity.verified_at = utc_now()
+    identity.verification_method = "live_selfie" if is_live else "selfie"
+    identity.verification_data = {
+        "face_similarity_score": round(face_similarity, 4),
+        "similarity_threshold": settings.FACE_SIMILARITY_THRESHOLD,
+        "verification_passed": True,
+        "is_live_capture": is_live,
+        "liveness_metadata": parsed_liveness.model_dump() if parsed_liveness else None,
+    }
 
     try:
         logger.info("Committing identity to database...")
@@ -173,8 +297,19 @@ async def register_identity(
         logger.info("Registering embedding in Qdrant...")
         await face_service.register_embedding(identity.id, embedding)
         logger.info("Embedding registered successfully")
+
+        # Auto-create marketplace listing if conditions are met
+        if identity.allow_commercial_use and identity.show_in_public_gallery:
+            try:
+                listing_service = ListingService(db)
+                listing = await listing_service.create_basic_listing(identity)
+                if listing:
+                    await db.commit()
+                    logger.info("Auto-created marketplace listing", listing_id=str(listing.id))
+            except Exception as listing_error:
+                # Don't fail the registration if listing creation fails
+                logger.warning("Failed to auto-create listing", error=str(listing_error))
     except Exception as e:
-        import traceback
         error_details = traceback.format_exc()
         logger.error(f"Registration failed: {str(e)}")
         logger.error(f"Traceback: {error_details}")
@@ -190,9 +325,46 @@ async def register_identity(
                 cleanup_error=str(cleanup_error),
                 original_error=str(e),
             )
-        raise HTTPException(500, f"Failed to register identity: {str(e)}")
+        # SECURITY FIX: Don't expose internal error details to client
+        raise HTTPException(500, "Failed to register identity. Please try again.")
 
     return identity
+
+
+@router.get("/gallery", response_model=IdentityListResponse)
+async def get_public_gallery(
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(50, ge=1, le=100, description="Maximum number of records to return"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get all verified identities that opted into the public gallery.
+
+    This endpoint is public and does not require authentication.
+    Returns identities with their profile images for browsing.
+    """
+    # Base query for filtering
+    base_query = select(Identity).where(
+        Identity.show_in_public_gallery == True,
+        Identity.status == "VERIFIED",
+        Identity.deleted_at.is_(None),
+    )
+
+    # Get total count
+    count_query = select(func.count()).select_from(base_query.subquery())
+    total = await db.scalar(count_query) or 0
+
+    # Apply pagination
+    offset = (page - 1) * limit
+    query = base_query.order_by(Identity.verified_at.desc()).offset(offset).limit(limit)
+    result = await db.execute(query)
+    identities = result.scalars().all()
+
+    return IdentityListResponse(
+        success=True,
+        data=[IdentityResponse.model_validate(i) for i in identities],
+        meta=PaginationMeta.create(page=page, limit=limit, total=total),
+    )
 
 
 @router.post("/verify", response_model=VerifyResponse)
@@ -332,25 +504,43 @@ async def verify_identity(
     )
 
 
-@router.get("/mine", response_model=List[IdentityResponse])
+@router.get("/mine", response_model=IdentityListResponse)
 async def get_my_identities(
     status: Optional[str] = None,
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(50, ge=1, le=100, description="Maximum number of records"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Get all identities owned by the current user"""
-    query = select(Identity).where(
+    logger.info(f"GET /identity/mine - user_id={current_user.id}, email={current_user.email}, status_filter={status}")
+
+    base_query = select(Identity).options(
+        selectinload(Identity.actor_pack)
+    ).where(
         Identity.user_id == current_user.id, Identity.deleted_at.is_(None)
     )
 
     if status:
-        query = query.where(Identity.status == status)
+        base_query = base_query.where(Identity.status == status)
 
-    query = query.order_by(Identity.created_at.desc())
+    # Get total count
+    count_query = select(func.count()).select_from(base_query.subquery())
+    total = await db.scalar(count_query) or 0
+
+    # Apply pagination
+    offset = (page - 1) * limit
+    query = base_query.order_by(Identity.created_at.desc()).offset(offset).limit(limit)
     result = await db.execute(query)
     identities = result.scalars().all()
 
-    return identities
+    logger.info(f"GET /identity/mine - returning {len(identities)} identities (total={total})")
+
+    return IdentityListResponse(
+        success=True,
+        data=[IdentityResponse.model_validate(i) for i in identities],
+        meta=PaginationMeta.create(page=page, limit=limit, total=total),
+    )
 
 
 @router.get("/{identity_id}", response_model=IdentityResponse)
@@ -359,16 +549,23 @@ async def get_identity(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Get a specific identity by ID"""
-    identity = await db.get(Identity, identity_id)
+    """Get a specific identity by ID, including actor pack training status"""
+    from app.models.identity import ActorPack
 
-    if not identity or identity.deleted_at:
-        raise HTTPException(404, "Identity not found")
+    # Load identity with actor_pack relation
+    stmt = (
+        select(Identity)
+        .where(Identity.id == identity_id)
+        .options(selectinload(Identity.actor_pack))
+    )
+    result = await db.execute(stmt)
+    identity = result.scalar_one_or_none()
 
-    # Only owner can view full details
-    if identity.user_id != current_user.id:
-        raise HTTPException(403, "Access denied")
+    # Treat soft-deleted as not found
+    if identity and identity.deleted_at:
+        identity = None
 
+    identity = get_owned_or_404(identity, current_user.id, "Identity")
     return identity
 
 
@@ -380,6 +577,7 @@ ALLOWED_IDENTITY_UPDATE_FIELDS = {
     "allow_commercial_use",
     "allow_ai_training",
     "allow_deepfake",
+    "show_in_public_gallery",
     "blocked_categories",
     "blocked_brands",
     "blocked_regions",
@@ -401,11 +599,11 @@ async def update_identity(
     """Update identity settings"""
     identity = await db.get(Identity, identity_id)
 
-    if not identity or identity.deleted_at:
-        raise HTTPException(404, "Identity not found")
+    # Treat soft-deleted as not found
+    if identity and identity.deleted_at:
+        identity = None
 
-    if identity.user_id != current_user.id:
-        raise HTTPException(403, "Access denied")
+    identity = get_owned_or_404(identity, current_user.id, "Identity")
 
     # Update fields - only allow specific fields (security: prevent status/protection_level manipulation)
     update_dict = update_data.model_dump(exclude_unset=True)
@@ -414,38 +612,79 @@ async def update_identity(
             raise HTTPException(400, f"Field '{field}' cannot be modified")
         setattr(identity, field, value)
 
-    identity.updated_at = datetime.utcnow()
+    identity.updated_at = utc_now()
+
+    # Check if listing settings changed and update marketplace listing accordingly
+    listing_fields_changed = any(
+        field in update_dict for field in ['allow_commercial_use', 'show_in_public_gallery']
+    )
+    if listing_fields_changed:
+        try:
+            listing_service = ListingService(db)
+            await listing_service.update_or_create_listing(identity)
+        except Exception as listing_error:
+            logger.warning("Failed to update marketplace listing", error=str(listing_error))
+
     await db.commit()
     await db.refresh(identity)
 
     return identity
 
 
-@router.delete("/{identity_id}")
+@router.delete("/{identity_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_identity(
     identity_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Soft delete an identity"""
+    """
+    Soft delete an identity.
+
+    **Returns:** 204 No Content on success.
+
+    **Errors:**
+    - 401: Unauthorized
+    - 403: Access denied (not your identity)
+    - 404: Identity not found
+    """
     identity = await db.get(Identity, identity_id)
 
-    if not identity or identity.deleted_at:
-        raise HTTPException(404, "Identity not found")
+    # Treat soft-deleted as not found
+    if identity and identity.deleted_at:
+        identity = None
 
-    if identity.user_id != current_user.id:
-        raise HTTPException(403, "Access denied")
+    identity = get_owned_or_404(identity, current_user.id, "Identity")
 
     # Soft delete
-    identity.deleted_at = datetime.utcnow()
-    identity.status = IdentityStatus.SUSPENDED
+    identity.deleted_at = utc_now()
+    identity.status = "SUSPENDED"
 
     # Remove from vector database
     await face_service.delete_embedding(identity_id)
 
+    # Deactivate marketplace listing
+    from sqlalchemy import select
+    from app.models.marketplace import Listing
+
+    listing_result = await db.execute(
+        select(Listing).where(
+            Listing.identity_id == identity_id,
+            Listing.is_active.is_(True)
+        )
+    )
+    listing = listing_result.scalar_one_or_none()
+    if listing:
+        listing.is_active = False
+        listing.updated_at = utc_now()
+        logger.info(
+            "Deactivated listing for deleted identity",
+            identity_id=str(identity_id),
+            listing_id=str(listing.id)
+        )
+
     await db.commit()
 
-    return {"message": "Identity deleted successfully"}
+    return None
 
 
 @router.get("/{identity_id}/stats")
@@ -457,19 +696,10 @@ async def get_identity_stats(
 ):
     """Get usage statistics for an identity"""
     identity = await db.get(Identity, identity_id)
-
-    if not identity:
-        raise HTTPException(404, "Identity not found")
-
-    if identity.user_id != current_user.id:
-        raise HTTPException(403, "Access denied")
+    identity = get_owned_or_404(identity, current_user.id, "Identity")
 
     # Get usage stats
-    from datetime import timedelta
-
-    from sqlalchemy import func
-
-    since = datetime.utcnow() - timedelta(days=days)
+    since = utc_now() - timedelta(days=days)
 
     # Count verifications
     verifications_query = select(func.count(UsageLog.id)).where(

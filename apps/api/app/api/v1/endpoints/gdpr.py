@@ -1,18 +1,23 @@
 """
 GDPR Compliance Endpoints
 Data export, deletion, consent management
+
+FIXED: Data export now queued via Redis/Celery instead of memory-based BackgroundTasks.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
+import httpx
 import structlog
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.database import get_db
+from app.core.helpers import utc_now  # MEDIUM FIX: Use timezone-aware datetime
 from app.core.security import get_current_user
 from app.models.identity import Identity, UsageLog
 from app.models.user import User
@@ -76,7 +81,7 @@ async def update_consent_settings(
     if consent.ai_training is not None:
         current_user.consent_ai_training = consent.ai_training
 
-    current_user.consent_updated_at = datetime.utcnow()
+    current_user.consent_updated_at = utc_now()
     await db.commit()
 
     logger.info("Consent updated", user_id=str(current_user.id))
@@ -89,7 +94,7 @@ async def accept_terms(
     current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
 ):
     """Accept terms of service"""
-    current_user.terms_accepted_at = datetime.utcnow()
+    current_user.terms_accepted_at = utc_now()
     await db.commit()
     return {"message": "Terms accepted"}
 
@@ -99,7 +104,7 @@ async def accept_privacy(
     current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
 ):
     """Accept privacy policy"""
-    current_user.privacy_accepted_at = datetime.utcnow()
+    current_user.privacy_accepted_at = utc_now()
     await db.commit()
     return {"message": "Privacy policy accepted"}
 
@@ -112,34 +117,55 @@ async def accept_privacy(
 @router.post("/export")
 async def request_data_export(
     request: DataExportRequest,
-    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Request export of all user data.
     GDPR Article 20 - Right to data portability.
+
+    FIXED: Now queues to Celery (Redis-backed) instead of memory-based BackgroundTasks.
     """
     # Check for recent export request (prevent abuse)
     if current_user.last_export_request:
-        hours_since = (datetime.utcnow() - current_user.last_export_request).total_seconds() / 3600
+        hours_since = (utc_now() - current_user.last_export_request).total_seconds() / 3600
         if hours_since < 24:
             raise HTTPException(
                 status_code=429, detail="You can only request a data export once every 24 hours"
             )
 
-    current_user.last_export_request = datetime.utcnow()
+    current_user.last_export_request = utc_now()
     await db.commit()
 
-    # Queue export job
-    background_tasks.add_task(
-        generate_data_export, user_id=str(current_user.id), format=request.format
-    )
+    # FIXED: Queue export job via Redis/Celery for reliability
+    await queue_data_export(str(current_user.id), current_user.email, request.format)
 
     return {
         "message": "Data export requested. You will receive an email when it's ready.",
         "estimated_time": "24 hours",
     }
+
+
+# Worker URL for queuing Celery tasks
+WORKER_URL = settings.WORKER_URL if hasattr(settings, 'WORKER_URL') else "http://localhost:8001"
+
+
+async def queue_data_export(user_id: str, email: str, format: str):
+    """
+    Queue data export task via Celery worker.
+
+    FIXED: Uses Celery queue (Redis-backed) instead of in-memory BackgroundTasks.
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{WORKER_URL}/tasks/generate_data_export",
+                json={"user_id": user_id, "email": email, "format": format},
+                timeout=5.0
+            )
+        logger.info("Data export queued", user_id=user_id)
+    except Exception as e:
+        logger.warning(f"Failed to queue data export: {e}", user_id=user_id)
 
 
 async def generate_data_export(user_id: str, format: str):
@@ -218,20 +244,26 @@ async def request_account_deletion(
     """
     Request account deletion.
     GDPR Article 17 - Right to erasure.
+
+    **Returns:** Deletion confirmation with scheduled date.
+
+    **Errors:**
+    - 400: Invalid confirmation text
+    - 401: Invalid password or unauthorized
     """
     # Verify confirmation
     if request.confirmation != "DELETE MY ACCOUNT":
-        raise HTTPException(status_code=400, detail="Please type 'DELETE MY ACCOUNT' to confirm")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Please type 'DELETE MY ACCOUNT' to confirm")
 
     # Verify password
     from app.core.security import verify_password
 
     if not verify_password(request.password, current_user.hashed_password):
-        raise HTTPException(status_code=400, detail="Invalid password")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid password")
 
     # Mark for deletion (actual deletion after grace period)
-    current_user.deletion_requested_at = datetime.utcnow()
-    current_user.deletion_scheduled_for = datetime.utcnow() + timedelta(days=30)
+    current_user.deletion_requested_at = utc_now()
+    current_user.deletion_scheduled_for = utc_now() + timedelta(days=30)
     current_user.is_active = False
     await db.commit()
 
@@ -273,7 +305,7 @@ async def record_cookie_consent(
 ):
     """Record cookie consent preferences"""
     current_user.cookie_consent = consent
-    current_user.cookie_consent_at = datetime.utcnow()
+    current_user.cookie_consent_at = utc_now()
     await db.commit()
 
     return {"message": "Cookie preferences saved"}
@@ -307,7 +339,7 @@ async def verify_age(
         )
 
     current_user.age_verified = True
-    current_user.age_verified_at = datetime.utcnow()
+    current_user.age_verified_at = utc_now()
     await db.commit()
 
     return {"message": "Age verified", "age": age}

@@ -1,6 +1,9 @@
 """
 Extended Authentication Endpoints
 Password Reset, Email Verification, 2FA
+
+FIXED: Emails now sent via Celery queue (Redis-backed) instead of memory-based
+BackgroundTasks for improved reliability.
 """
 
 import base64
@@ -8,54 +11,33 @@ import io
 import secrets
 from datetime import datetime, timedelta
 
+import httpx
 import pyotp
 import qrcode
 import structlog
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
-from pydantic import BaseModel, EmailStr
+from fastapi import APIRouter, Depends, HTTPException, Request
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.helpers import utc_now  # MEDIUM FIX: Use timezone-aware datetime
 from app.core.database import get_db
-from app.core.security import get_current_user, hash_password
+from app.core.security import get_current_user, hash_password, decode_2fa_pending_token, create_access_token, create_refresh_token
 from app.models.user import User
+from app.schemas.auth import (
+    EmailVerificationRequest,
+    Enable2FAResponse,
+    PasswordResetConfirm,
+    PasswordResetRequest,
+    Verify2FALogin,
+    Verify2FARequest,
+)
 
 logger = structlog.get_logger()
 router = APIRouter()
-
-
-# ===========================================
-# Schemas
-# ===========================================
-
-
-class PasswordResetRequest(BaseModel):
-    email: EmailStr
-
-
-class PasswordResetConfirm(BaseModel):
-    token: str
-    new_password: str
-
-
-class EmailVerificationRequest(BaseModel):
-    token: str
-
-
-class Enable2FAResponse(BaseModel):
-    secret: str
-    qr_code: str
-    backup_codes: list[str]
-
-
-class Verify2FARequest(BaseModel):
-    code: str
-
-
-class Verify2FALogin(BaseModel):
-    user_id: str
-    code: str
+limiter = Limiter(key_func=get_remote_address)
 
 
 # ===========================================
@@ -64,44 +46,48 @@ class Verify2FALogin(BaseModel):
 
 
 @router.post("/password-reset/request")
+@limiter.limit("3/minute")
 async def request_password_reset(
-    request: PasswordResetRequest,
-    background_tasks: BackgroundTasks,
+    request: Request,
+    reset_request: PasswordResetRequest,
     db: AsyncSession = Depends(get_db),
 ):
     """
     Request a password reset email.
     Always returns success to prevent email enumeration.
+
+    Rate limited to 3 requests per minute to prevent abuse.
     """
-    result = await db.execute(select(User).where(User.email == request.email))
+    result = await db.execute(
+        select(User).where(User.email == reset_request.email, User.deleted_at.is_(None))
+    )
     user = result.scalar_one_or_none()
 
     if user:
         # Generate reset token
         reset_token = secrets.token_urlsafe(32)
         user.password_reset_token = reset_token
-        user.password_reset_expires = datetime.utcnow() + timedelta(hours=1)
+        user.password_reset_expires = utc_now() + timedelta(hours=1)
         await db.commit()
 
-        # Send email in background
-        background_tasks.add_task(
-            send_password_reset_email, email=user.email, token=reset_token, name=user.first_name
-        )
+        # FIXED: Queue email via Celery (Redis-backed) instead of in-memory BackgroundTasks
+        await queue_password_reset_email(user.email, reset_token, user.first_name)
 
-        logger.info("Password reset requested", email=request.email)
+        logger.info("Password reset requested")
 
     # Always return success
     return {"message": "If an account exists, a reset email has been sent."}
 
 
 @router.post("/password-reset/confirm")
-async def confirm_password_reset(request: PasswordResetConfirm, db: AsyncSession = Depends(get_db)):
+@limiter.limit("5/minute")
+async def confirm_password_reset(request: Request, body: PasswordResetConfirm, db: AsyncSession = Depends(get_db)):
     """Confirm password reset with token"""
     # Fetch user with active reset token
     result = await db.execute(
         select(User).where(
             User.password_reset_token.isnot(None),
-            User.password_reset_expires > datetime.utcnow(),
+            User.password_reset_expires > utc_now(),
         )
     )
     users_with_tokens = result.scalars().all()
@@ -109,7 +95,7 @@ async def confirm_password_reset(request: PasswordResetConfirm, db: AsyncSession
     # Use constant-time comparison to prevent timing attacks
     user = None
     for u in users_with_tokens:
-        if u.password_reset_token and secrets.compare_digest(u.password_reset_token, request.token):
+        if u.password_reset_token and secrets.compare_digest(u.password_reset_token, body.token):
             user = u
             break
 
@@ -117,18 +103,20 @@ async def confirm_password_reset(request: PasswordResetConfirm, db: AsyncSession
         raise HTTPException(status_code=400, detail="Invalid or expired reset token")
 
     # Validate password strength
-    if len(request.new_password) < 8:
+    if len(body.new_password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
 
     # Update password
-    user.hashed_password = hash_password(request.new_password)
+    user.hashed_password = hash_password(body.new_password)
     user.password_reset_token = None
     user.password_reset_expires = None
+    # SECURITY: Set password_changed_at to invalidate all existing sessions
+    user.password_changed_at = utc_now()
     await db.commit()
 
-    logger.info("Password reset completed", user_id=str(user.id))
+    logger.info("Password reset completed - all sessions invalidated", user_id=str(user.id))
 
-    return {"message": "Password has been reset successfully"}
+    return {"message": "Password has been reset successfully. Please log in again."}
 
 
 # ===========================================
@@ -138,7 +126,6 @@ async def confirm_password_reset(request: PasswordResetConfirm, db: AsyncSession
 
 @router.post("/verify-email/send")
 async def send_verification_email(
-    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -149,30 +136,28 @@ async def send_verification_email(
     # Generate verification token
     verification_token = secrets.token_urlsafe(32)
     current_user.email_verification_token = verification_token
-    current_user.email_verification_expires = datetime.utcnow() + timedelta(hours=24)
+    current_user.email_verification_expires = utc_now() + timedelta(hours=24)
     await db.commit()
 
-    # Send email
-    background_tasks.add_task(
-        send_verification_email_task,
-        email=current_user.email,
-        token=verification_token,
-        name=current_user.first_name,
-    )
+    # FIXED: Queue email via Celery (Redis-backed) instead of in-memory BackgroundTasks
+    await queue_verification_email(current_user.email, verification_token, current_user.first_name)
 
     return {"message": "Verification email sent"}
 
 
 @router.post("/verify-email/confirm")
+@limiter.limit("10/minute")
 async def confirm_email_verification(
-    request: EmailVerificationRequest, db: AsyncSession = Depends(get_db)
+    request: Request,
+    body: EmailVerificationRequest,
+    db: AsyncSession = Depends(get_db),
 ):
     """Confirm email with verification token"""
     # Fetch users with active verification tokens
     result = await db.execute(
         select(User).where(
             User.email_verification_token.isnot(None),
-            User.email_verification_expires > datetime.utcnow(),
+            User.email_verification_expires > utc_now(),
         )
     )
     users_with_tokens = result.scalars().all()
@@ -180,7 +165,7 @@ async def confirm_email_verification(
     # Use constant-time comparison to prevent timing attacks
     user = None
     for u in users_with_tokens:
-        if u.email_verification_token and secrets.compare_digest(u.email_verification_token, request.token):
+        if u.email_verification_token and secrets.compare_digest(u.email_verification_token, body.token):
             user = u
             break
 
@@ -188,7 +173,7 @@ async def confirm_email_verification(
         raise HTTPException(status_code=400, detail="Invalid or expired verification token")
 
     user.is_verified = True
-    user.verified_at = datetime.utcnow()
+    user.verified_at = utc_now()
     user.email_verification_token = None
     user.email_verification_expires = None
     await db.commit()
@@ -280,97 +265,138 @@ async def disable_2fa(
 
 
 @router.post("/2fa/verify-login")
-async def verify_2fa_login(request: Verify2FALogin, db: AsyncSession = Depends(get_db)):
-    """Verify 2FA code during login"""
-    result = await db.execute(select(User).where(User.id == request.user_id))
+@limiter.limit("5/minute")
+async def verify_2fa_login(request: Request, body: Verify2FALogin, db: AsyncSession = Depends(get_db)):
+    """
+    Verify 2FA code during login.
+
+    **SECURITY FIX:** Now requires a pending_token instead of user_id.
+    This token is issued after successful password verification and proves
+    the user has passed the first authentication factor.
+
+    The pending_token is valid for only 5 minutes to prevent replay attacks.
+
+    **Rate Limiting:** This endpoint is rate limited to prevent brute force
+    attacks on TOTP codes.
+    """
+    # SECURITY: Validate the pending token
+    payload = decode_2fa_pending_token(body.pending_token)
+    if not payload:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired authentication token. Please login again."
+        )
+
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+
+    result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
 
     if not user or not user.totp_secret:
         raise HTTPException(status_code=400, detail="Invalid request")
 
-    # Check TOTP code
+    if not user.is_active:
+        raise HTTPException(status_code=401, detail="Account is inactive")
+
+    # Check TOTP code (with window=1 for slight clock skew tolerance)
     totp = pyotp.TOTP(user.totp_secret)
-    if totp.verify(request.code):
-        # Generate access token
-        from app.core.security import create_access_token
-
-        access_token = create_access_token(data={"sub": str(user.id)})
-        return {"access_token": access_token, "token_type": "bearer"}
-
-    # Check backup codes
-    if user.backup_codes and request.code.upper() in user.backup_codes:
-        user.backup_codes.remove(request.code.upper())
+    if totp.verify(body.code, valid_window=1):
+        # Update last login
+        user.last_login_at = utc_now()
         await db.commit()
 
-        from app.core.security import create_access_token
+        # Generate full tokens
+        token_data = {"sub": str(user.id), "email": user.email}
+        access_token = create_access_token(data=token_data)
+        refresh_token = create_refresh_token(data=token_data)
 
-        access_token = create_access_token(data={"sub": str(user.id)})
-        return {"access_token": access_token, "token_type": "bearer"}
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer",
+        }
+
+    # Check backup codes
+    if user.backup_codes and body.code.upper() in user.backup_codes:
+        user.backup_codes.remove(body.code.upper())
+        user.last_login_at = utc_now()
+        await db.commit()
+
+        token_data = {"sub": str(user.id), "email": user.email}
+        access_token = create_access_token(data=token_data)
+        refresh_token = create_refresh_token(data=token_data)
+
+        logger.info("Backup code used for 2FA", user_id=str(user.id))
+
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer",
+        }
 
     raise HTTPException(status_code=400, detail="Invalid code")
 
 
 # ===========================================
-# Email Helper Functions
+# Email Queue Functions (via Celery Worker)
 # ===========================================
 
+# Worker URL for queuing Celery tasks
+WORKER_URL = settings.WORKER_URL if hasattr(settings, 'WORKER_URL') else "http://localhost:8001"
 
-async def send_email(to_email: str, subject: str, html_content: str):
+
+async def queue_password_reset_email(email: str, token: str, name: str):
     """
-    Send email using SendGrid.
-    Falls back to logging in development mode.
+    Queue password reset email via Celery worker.
+
+    FIXED: Uses Celery queue (Redis-backed) instead of in-memory BackgroundTasks.
+    This ensures emails are still sent even if the API server restarts.
     """
-    if not settings.SENDGRID_API_KEY:
-        logger.warning(f"Email not sent (no API key): {subject} -> {to_email}")
-        return
-
-    try:
-        import sendgrid
-        from sendgrid.helpers.mail import Content, Email, Mail, To
-
-        sg = sendgrid.SendGridAPIClient(api_key=settings.SENDGRID_API_KEY)
-        from_email = Email(settings.EMAIL_FROM, settings.EMAIL_FROM_NAME)
-        to_email_obj = To(to_email)
-        content = Content("text/html", html_content)
-        mail = Mail(from_email, to_email_obj, subject, content)
-
-        response = sg.client.mail.send.post(request_body=mail.get())
-        logger.info(f"Email sent: {subject} -> {to_email}, status: {response.status_code}")
-    except Exception as e:
-        logger.error(f"Failed to send email: {e}")
-        raise
-
-
-async def send_password_reset_email(email: str, token: str, name: str):
-    """Send password reset email"""
     reset_url = f"{settings.FRONTEND_URL}/reset-password?token={token}"
-
-    html_content = f"""
+    subject = "Reset Your ActorHub.ai Password"
+    body = f"Hi {name or 'there'}, click here to reset your password: {reset_url}"
+    html = f"""
     <html>
     <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-        <h2>Password Reset Request</h2>
+        <h2>Reset Your Password</h2>
         <p>Hi {name or 'there'},</p>
-        <p>We received a request to reset your password. Click the button below to create a new password:</p>
+        <p>You requested to reset your password. Click the button below:</p>
         <p style="text-align: center; margin: 30px 0;">
             <a href="{reset_url}" style="background-color: #4F46E5; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">Reset Password</a>
         </p>
-        <p>This link will expire in 1 hour.</p>
-        <p>If you didn't request this, you can safely ignore this email.</p>
+        <p>This link expires in 1 hour. If you didn't request this, ignore this email.</p>
         <hr style="border: none; border-top: 1px solid #eee; margin: 30px 0;">
         <p style="color: #666; font-size: 12px;">ActorHub.ai - Protect Your Digital Identity</p>
     </body>
     </html>
     """
 
-    await send_email(email, "Reset Your ActorHub.ai Password", html_content)
-    logger.info(f"Password reset email sent to {email}")
+    # Queue via Redis/Celery for reliability
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{WORKER_URL}/tasks/send_email",
+                json={"to": email, "subject": subject, "body": body, "html": html},
+                timeout=5.0
+            )
+        logger.info("Password reset email queued", email=email)
+    except Exception as e:
+        # Fallback: log but don't fail the request
+        logger.warning(f"Failed to queue password reset email: {e}", email=email)
 
 
-async def send_verification_email_task(email: str, token: str, name: str):
-    """Send email verification email"""
+async def queue_verification_email(email: str, token: str, name: str):
+    """
+    Queue email verification via Celery worker.
+
+    FIXED: Uses Celery queue (Redis-backed) instead of in-memory BackgroundTasks.
+    """
     verify_url = f"{settings.FRONTEND_URL}/verify-email?token={token}"
-
-    html_content = f"""
+    subject = "Verify Your ActorHub.ai Email"
+    body = f"Hi {name or 'there'}, verify your email here: {verify_url}"
+    html = f"""
     <html>
     <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
         <h2>Verify Your Email</h2>
@@ -386,5 +412,15 @@ async def send_verification_email_task(email: str, token: str, name: str):
     </html>
     """
 
-    await send_email(email, "Verify Your ActorHub.ai Email", html_content)
-    logger.info(f"Verification email sent to {email}")
+    # Queue via Redis/Celery for reliability
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{WORKER_URL}/tasks/send_email",
+                json={"to": email, "subject": subject, "body": body, "html": html},
+                timeout=5.0
+            )
+        logger.info("Verification email queued", email=email)
+    except Exception as e:
+        # Fallback: log but don't fail the request
+        logger.warning(f"Failed to queue verification email: {e}", email=email)
