@@ -1,0 +1,447 @@
+# Prometheus Alerting Rules for ActorHub.ai
+# Deploy to Prometheus/AlertManager
+
+groups:
+  # ===========================================
+  # API Health Alerts
+  # ===========================================
+  - name: actorhub-api-health
+    rules:
+      # High error rate (5xx errors)
+      - alert: HighErrorRate
+        expr: |
+          (
+            sum(rate(http_requests_total{status=~"5.."}[5m])) /
+            sum(rate(http_requests_total[5m]))
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: "High API error rate (> 5%)"
+          description: "Error rate is {{ $value | printf \"%.2f\" }}% over the last 5 minutes"
+          runbook: "https://docs.actorhub.ai/runbooks/high-error-rate"
+
+      # Very high error rate - page immediately
+      - alert: CriticalErrorRate
+        expr: |
+          (
+            sum(rate(http_requests_total{status=~"5.."}[2m])) /
+            sum(rate(http_requests_total[2m]))
+          ) > 0.20
+        for: 2m
+        labels:
+          severity: page
+          team: backend
+        annotations:
+          summary: "CRITICAL: API error rate > 20%"
+          description: "Immediate attention required. Error rate is {{ $value | printf \"%.2f\" }}%"
+
+      # Slow response times (P95 > 2s)
+      - alert: SlowResponseTime
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(http_request_duration_seconds_bucket[5m])) by (le)
+          ) > 2
+        for: 5m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Slow API response time (P95 > 2s)"
+          description: "P95 latency is {{ $value | printf \"%.2f\" }}s"
+          runbook: "https://docs.actorhub.ai/runbooks/slow-response"
+
+      # Very slow response times (P95 > 5s)
+      - alert: VerySlowResponseTime
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(http_request_duration_seconds_bucket[5m])) by (le)
+          ) > 5
+        for: 3m
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: "Very slow API response time (P95 > 5s)"
+          description: "P95 latency is {{ $value | printf \"%.2f\" }}s - users are experiencing significant delays"
+
+      # No requests (API might be down)
+      - alert: NoTraffic
+        expr: |
+          sum(rate(http_requests_total[5m])) == 0
+        for: 5m
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: "No API traffic detected"
+          description: "API has received no requests for 5 minutes - service may be down"
+
+  # ===========================================
+  # Infrastructure Alerts
+  # ===========================================
+  - name: actorhub-infrastructure
+    rules:
+      # Database connection pool exhausted
+      - alert: DatabasePoolExhausted
+        expr: db_connection_pool_size >= 95
+        for: 2m
+        labels:
+          severity: critical
+          team: infrastructure
+        annotations:
+          summary: "Database connection pool nearly exhausted"
+          description: "Pool usage is at {{ $value }}% - queries may start failing"
+          runbook: "https://docs.actorhub.ai/runbooks/db-pool-exhausted"
+
+      # Circuit breaker open
+      - alert: CircuitBreakerOpen
+        expr: circuit_breaker_state == 1
+        for: 1m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Circuit breaker OPEN for {{ $labels.service }}"
+          description: "Service {{ $labels.service }} has been failing - circuit breaker is protecting the system"
+          runbook: "https://docs.actorhub.ai/runbooks/circuit-breaker"
+
+      # Circuit breaker stuck open (extended outage)
+      - alert: CircuitBreakerStuckOpen
+        expr: circuit_breaker_state == 1
+        for: 15m
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: "Circuit breaker STUCK OPEN for {{ $labels.service }}"
+          description: "Service {{ $labels.service }} has been unavailable for 15+ minutes"
+
+      # High retry rate
+      - alert: HighRetryRate
+        expr: |
+          sum(rate(retry_attempts_total[5m])) by (service) > 10
+        for: 5m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "High retry rate for {{ $labels.service }}"
+          description: "{{ $labels.service }} is experiencing {{ $value | printf \"%.1f\" }} retries/sec"
+
+      # Retries exhausted
+      - alert: RetriesExhausted
+        expr: |
+          sum(rate(retry_exhausted_total[5m])) by (service, operation) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Operations failing after max retries"
+          description: "{{ $labels.service }}.{{ $labels.operation }} is exhausting retries"
+
+  # ===========================================
+  # External Service Alerts
+  # ===========================================
+  - name: actorhub-external-services
+    rules:
+      # Stripe API slow
+      - alert: StripeAPISlow
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(external_service_latency_seconds_bucket{service="stripe"}[5m])) by (le)
+          ) > 5
+        for: 5m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Stripe API responding slowly"
+          description: "Stripe P95 latency is {{ $value | printf \"%.2f\" }}s"
+
+      # Stripe API errors
+      - alert: StripeAPIErrors
+        expr: |
+          sum(rate(external_service_calls_total{service="stripe", status="error"}[5m])) /
+          sum(rate(external_service_calls_total{service="stripe"}[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: "High Stripe API error rate"
+          description: "{{ $value | printf \"%.1f\" }}% of Stripe calls are failing"
+
+      # Replicate API slow (affects training)
+      - alert: ReplicateAPISlow
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(external_service_latency_seconds_bucket{service="replicate"}[5m])) by (le)
+          ) > 30
+        for: 10m
+        labels:
+          severity: warning
+          team: ml
+        annotations:
+          summary: "Replicate API responding slowly"
+          description: "Training operations may be delayed"
+
+      # SendGrid errors (email delivery issues)
+      - alert: SendGridErrors
+        expr: |
+          sum(rate(external_service_calls_total{service="sendgrid", status="error"}[15m])) > 0.5
+        for: 15m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "SendGrid email delivery issues"
+          description: "Email notifications may not be delivered"
+
+  # ===========================================
+  # Business Metrics Alerts
+  # ===========================================
+  - name: actorhub-business
+    rules:
+      # Training failures spike
+      - alert: TrainingFailuresHigh
+        expr: |
+          sum(rate(actor_pack_trainings_total{status="failed"}[1h])) /
+          sum(rate(actor_pack_trainings_total[1h])) > 0.2
+        for: 30m
+        labels:
+          severity: warning
+          team: ml
+        annotations:
+          summary: "High Actor Pack training failure rate"
+          description: "{{ $value | printf \"%.1f\" }}% of trainings are failing"
+
+      # Identity verification failures
+      - alert: VerificationFailuresHigh
+        expr: |
+          sum(rate(identity_verifications_total{matched="false"}[1h])) /
+          sum(rate(identity_verifications_total[1h])) > 0.5
+        for: 1h
+        labels:
+          severity: warning
+          team: ml
+        annotations:
+          summary: "High identity verification failure rate"
+          description: "Over 50% of verifications are failing - check face recognition service"
+
+      # No registrations (potential issue)
+      - alert: NoRegistrations
+        expr: |
+          sum(rate(identity_registrations_total[1h])) == 0
+        for: 4h
+        labels:
+          severity: info
+          team: product
+        annotations:
+          summary: "No identity registrations in 4 hours"
+          description: "This may be normal during off-peak hours, or indicate an issue"
+
+      # Payment failures
+      - alert: PaymentFailuresHigh
+        expr: |
+          sum(rate(license_purchases_total{status="failed"}[1h])) /
+          sum(rate(license_purchases_total[1h])) > 0.1
+        for: 30m
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: "High payment failure rate"
+          description: "{{ $value | printf \"%.1f\" }}% of purchases are failing - revenue impact"
+
+  # ===========================================
+  # Rate Limiting Alerts
+  # ===========================================
+  - name: actorhub-rate-limiting
+    rules:
+      # High rate limit hits (potential abuse)
+      - alert: RateLimitAbuse
+        expr: |
+          sum(rate(rate_limit_exceeded_total[5m])) by (endpoint) > 10
+        for: 5m
+        labels:
+          severity: warning
+          team: security
+        annotations:
+          summary: "High rate limiting on {{ $labels.endpoint }}"
+          description: "Possible abuse or misconfigured client"
+
+      # Auth endpoint rate limiting (potential attack)
+      - alert: AuthRateLimitSpike
+        expr: |
+          sum(rate(rate_limit_exceeded_total{endpoint=~".*/login|.*/register"}[5m])) > 20
+        for: 2m
+        labels:
+          severity: critical
+          team: security
+        annotations:
+          summary: "Potential brute force attack on auth endpoints"
+          description: "High rate of blocked auth requests - investigate immediately"
+
+  # ===========================================
+  # Worker/Queue Alerts
+  # ===========================================
+  - name: actorhub-workers
+    rules:
+      # Active trainings too high (queue backup)
+      - alert: TrainingQueueBacklog
+        expr: actor_pack_trainings_active > 50
+        for: 30m
+        labels:
+          severity: warning
+          team: ml
+        annotations:
+          summary: "Training queue backlog"
+          description: "{{ $value }} trainings active - consider scaling workers"
+
+      # No active trainings (workers may be down)
+      - alert: WorkersMayBeDown
+        expr: |
+          actor_pack_trainings_active == 0
+          AND
+          sum(rate(celery_task_started_total{queue="training"}[1h])) > 0
+        for: 30m
+        labels:
+          severity: critical
+          team: infrastructure
+        annotations:
+          summary: "Workers may be down"
+          description: "Pending trainings but no active processing"
+
+      # High task failure rate
+      - alert: HighTaskFailureRate
+        expr: |
+          sum(rate(celery_task_completed_total{status="failure"}[5m])) /
+          sum(rate(celery_task_completed_total[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "High Celery task failure rate"
+          description: "{{ $value | printf \"%.1f\" }}% of tasks are failing"
+
+      # Critical task failure rate
+      - alert: CriticalTaskFailureRate
+        expr: |
+          sum(rate(celery_task_completed_total{status="failure"}[5m])) /
+          sum(rate(celery_task_completed_total[5m])) > 0.25
+        for: 3m
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: "CRITICAL: Very high task failure rate (> 25%)"
+          description: "Immediate attention required"
+
+      # High retry rate indicates instability
+      - alert: HighTaskRetryRate
+        expr: |
+          sum(rate(celery_task_retries_total[5m])) /
+          sum(rate(celery_task_started_total[5m])) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "High task retry rate"
+          description: "{{ $value | printf \"%.1f\" }}% of tasks are retrying"
+
+      # Slow task execution
+      - alert: SlowTaskExecution
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(celery_task_duration_seconds_bucket[5m])) by (le, task_name)
+          ) > 300
+        for: 10m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Slow task execution: {{ $labels.task_name }}"
+          description: "P95 task duration is {{ $value | printf \"%.1f\" }}s"
+
+      # Queue-specific alerts
+      - alert: TrainingQueueStalled
+        expr: |
+          sum(rate(celery_task_completed_total{queue="training"}[30m])) == 0
+          AND
+          celery_queue_length{queue="training"} > 0
+        for: 30m
+        labels:
+          severity: critical
+          team: ml
+        annotations:
+          summary: "Training queue stalled"
+          description: "No trainings completing but queue has {{ $value }} items"
+
+      - alert: PayoutQueueStalled
+        expr: |
+          sum(rate(celery_task_completed_total{queue="payouts"}[1h])) == 0
+          AND
+          celery_queue_length{queue="payouts"} > 0
+        for: 1h
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: "Payout queue stalled"
+          description: "Payouts not processing - creators may not receive money"
+
+      # Distributed lock failures
+      - alert: DistributedLockFailures
+        expr: |
+          sum(rate(distributed_locks_failed_total{reason="redis_error"}[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "Distributed lock Redis failures"
+          description: "Redis may be having issues"
+
+      # Email delivery issues
+      - alert: EmailDeliveryIssues
+        expr: |
+          sum(rate(emails_sent_total{status="failed"}[15m])) /
+          sum(rate(emails_sent_total[15m])) > 0.1
+        for: 15m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Email delivery failures > 10%"
+          description: "Check SendGrid status and configuration"
+
+      # Payout failures
+      - alert: PayoutFailures
+        expr: |
+          sum(rate(payout_failures_total[1h])) > 0
+        for: 30m
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: "Payout failures detected"
+          description: "Creators may not be receiving money - investigate immediately"
+
+      # Face verification accuracy drop
+      - alert: FaceVerificationAccuracyDrop
+        expr: |
+          sum(rate(face_verifications_total{matched="true"}[1h])) /
+          sum(rate(face_verifications_total[1h])) < 0.3
+        for: 1h
+        labels:
+          severity: warning
+          team: ml
+        annotations:
+          summary: "Face verification accuracy dropped"
+          description: "Less than 30% of verifications are matching - check model"
