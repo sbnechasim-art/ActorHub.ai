@@ -2,12 +2,14 @@
 
 import { useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Shield, DollarSign, Eye, TrendingUp, Plus, ArrowRight, LogOut } from 'lucide-react'
+import { Shield, DollarSign, Eye, TrendingUp, Plus, ArrowRight, LogOut, Loader2, CheckCircle, XCircle, Clock } from 'lucide-react'
 import Link from 'next/link'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
-import { userApi, identityApi } from '@/lib/api'
+import { Skeleton, SkeletonCard, IdentityCardSkeleton } from '@/components/ui/skeleton'
+import { userApi, identityApi, actorPackApi, ActorPack } from '@/lib/api'
 import { useAuth } from '@/hooks/useAuth'
+import { getProxiedImageUrl } from '@/lib/utils'
 
 function formatCurrency(value: number) {
   return new Intl.NumberFormat('en-US', {
@@ -61,14 +63,16 @@ function StatsCard({
 }
 
 function IdentityCard({ identity }: { identity: any }) {
+  const imageUrl = getProxiedImageUrl(identity.profile_image_url)
+
   return (
     <Card className="bg-slate-800/50 border-slate-700 hover:border-slate-600 transition cursor-pointer">
       <CardContent className="p-4">
         <div className="flex items-center gap-4">
           <div className="w-16 h-16 rounded-full bg-slate-700 overflow-hidden flex items-center justify-center">
-            {identity.profile_image_url ? (
+            {imageUrl ? (
               <img
-                src={identity.profile_image_url}
+                src={imageUrl}
                 alt={identity.display_name}
                 className="w-full h-full object-cover"
               />
@@ -101,6 +105,70 @@ function IdentityCard({ identity }: { identity: any }) {
   )
 }
 
+// Training Progress Card Component
+function TrainingProgressCard({ pack }: { pack: ActorPack }) {
+  const statusConfig = {
+    QUEUED: { icon: Clock, color: 'text-yellow-400', bg: 'bg-yellow-500/20', label: 'ממתין בתור' },
+    PROCESSING: { icon: Loader2, color: 'text-blue-400', bg: 'bg-blue-500/20', label: 'מאמן...' },
+    COMPLETED: { icon: CheckCircle, color: 'text-green-400', bg: 'bg-green-500/20', label: 'הושלם' },
+    FAILED: { icon: XCircle, color: 'text-red-400', bg: 'bg-red-500/20', label: 'נכשל' },
+  }
+
+  const status = statusConfig[pack.training_status as keyof typeof statusConfig] || statusConfig.QUEUED
+  const StatusIcon = status.icon
+  const isActive = pack.training_status === 'PROCESSING' || pack.training_status === 'QUEUED'
+  // Removed duplicate polling - parent useQuery handles refetching
+
+  return (
+    <Card className={`border ${isActive ? 'border-blue-500/50 bg-blue-500/5' : 'border-slate-700 bg-slate-800/50'}`}>
+      <CardContent className="p-4">
+        <div className="flex items-center gap-4">
+          <div className={`w-12 h-12 rounded-full ${status.bg} flex items-center justify-center`}>
+            <StatusIcon className={`w-6 h-6 ${status.color} ${pack.training_status === 'PROCESSING' ? 'animate-spin' : ''}`} />
+          </div>
+          <div className="flex-1">
+            <div className="flex items-center justify-between">
+              <h4 className="font-medium text-white">Actor Pack</h4>
+              <span className={`text-xs ${status.color}`}>{status.label}</span>
+            </div>
+
+            {/* Progress Bar */}
+            {isActive && (
+              <div className="mt-2">
+                <div className="flex justify-between text-xs text-slate-400 mb-1">
+                  <span>התקדמות אימון</span>
+                  <span>{pack.training_progress || 0}%</span>
+                </div>
+                <div className="w-full h-2 bg-slate-700 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-gradient-to-r from-blue-500 to-purple-500 transition-all duration-500 ease-out"
+                    style={{ width: `${pack.training_progress || 0}%` }}
+                  />
+                </div>
+                <p className="text-xs text-slate-500 mt-1">
+                  {pack.training_progress < 30 && 'מתחיל אימון...'}
+                  {pack.training_progress >= 30 && pack.training_progress < 70 && 'מאמן את המודל...'}
+                  {pack.training_progress >= 70 && pack.training_progress < 100 && 'מסיים אימון...'}
+                </p>
+              </div>
+            )}
+
+            {/* Error message */}
+            {pack.training_status === 'FAILED' && pack.training_error && (
+              <p className="text-xs text-red-400 mt-2">{pack.training_error}</p>
+            )}
+
+            {/* Completed message */}
+            {pack.training_status === 'COMPLETED' && (
+              <p className="text-xs text-green-400 mt-2">Actor Pack מוכן לשימוש!</p>
+            )}
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
 export default function DashboardPage() {
   const { user, isLoading: authLoading, isAuthenticated, logout, requireAuth } = useAuth()
 
@@ -119,17 +187,68 @@ export default function DashboardPage() {
   })
 
   // Fetch user's identities from real API
-  const { data: identities, isLoading: identitiesLoading } = useQuery({
+  const { data: identitiesResponse, isLoading: identitiesLoading } = useQuery({
     queryKey: ['my-identities'],
     queryFn: () => identityApi.getMyIdentities(),
     enabled: isAuthenticated,
   })
 
+  // Fetch user's actor packs (for training progress)
+  const { data: actorPacks } = useQuery({
+    queryKey: ['my-actor-packs'],
+    queryFn: () => actorPackApi.getMyPacks(),
+    enabled: isAuthenticated,
+    // Smart polling: only poll when there are active trainings
+    refetchInterval: (query) => {
+      const packs = query.state.data as ActorPack[] | undefined
+      const hasActiveTrainings = packs?.some(
+        p => p.training_status === 'PROCESSING' || p.training_status === 'QUEUED'
+      )
+      return hasActiveTrainings ? 10000 : false // 10 seconds when training, disabled otherwise
+    },
+  })
+
+  // Filter active trainings
+  const activeTrainings = actorPacks?.filter(
+    (pack: ActorPack) => pack.training_status === 'PROCESSING' || pack.training_status === 'QUEUED'
+  ) || []
+
+  // Extract identities array from paginated response
+  const identities = identitiesResponse?.data || []
+
   // Show loading while checking auth
   if (authLoading) {
     return (
-      <div className="min-h-screen bg-slate-900 flex items-center justify-center">
-        <div className="text-white">Loading...</div>
+      <div className="p-8">
+        {/* Header skeleton */}
+        <div className="mb-8 flex items-center justify-between">
+          <div>
+            <Skeleton className="h-8 w-64 mb-2" />
+            <Skeleton className="h-4 w-96" />
+          </div>
+          <Skeleton className="h-10 w-24" />
+        </div>
+
+        {/* Stats skeleton */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+          {[1, 2, 3, 4].map((i) => (
+            <SkeletonCard key={i} />
+          ))}
+        </div>
+
+        {/* Content skeleton */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+          <div className="lg:col-span-2 space-y-4">
+            <Skeleton className="h-6 w-48 mb-4" />
+            {[1, 2, 3].map((i) => (
+              <IdentityCardSkeleton key={i} />
+            ))}
+          </div>
+          <div>
+            <Skeleton className="h-6 w-32 mb-4" />
+            <SkeletonCard className="h-64" />
+          </div>
+        </div>
       </div>
     )
   }
@@ -190,6 +309,24 @@ export default function DashboardPage() {
           color="orange"
         />
       </div>
+
+      {/* Training Progress Section - Shows when there are active trainings */}
+      {activeTrainings.length > 0 && (
+        <div className="mb-8">
+          <div className="flex items-center gap-2 mb-4">
+            <Loader2 className="w-5 h-5 text-blue-400 animate-spin" />
+            <h2 className="text-xl font-semibold text-white">אימון Actor Pack פעיל</h2>
+            <span className="px-2 py-0.5 bg-blue-500/20 text-blue-400 text-xs rounded-full">
+              {activeTrainings.length} {activeTrainings.length === 1 ? 'אימון' : 'אימונים'}
+            </span>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {activeTrainings.map((pack: ActorPack) => (
+              <TrainingProgressCard key={pack.id} pack={pack} />
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Main Content */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
