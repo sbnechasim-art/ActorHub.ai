@@ -40,6 +40,22 @@ class WorkerSettings(BaseSettings):
     CELERY_BROKER_URL: str = "redis://localhost:6380/0"
     CELERY_RESULT_BACKEND: str = "redis://localhost:6380/1"
 
+    # Stripe
+    STRIPE_SECRET_KEY: str = ""
+
+    # SendGrid Email
+    SENDGRID_API_KEY: str = ""
+    EMAIL_FROM: str = "noreply@actorhub.ai"
+    EMAIL_FROM_NAME: str = "ActorHub.ai"
+    APP_NAME: str = "ActorHub.ai"
+    FRONTEND_URL: str = "http://localhost:3000"
+
+    # Payouts
+    PAYOUT_HOLDING_DAYS: int = 7
+    PAYOUT_MINIMUM_USD: float = 50.0
+    PAYOUT_PLATFORM_FEE_PERCENT: float = 20.0
+    PAYOUT_AUTO_ENABLED: bool = True
+
     class Config:
         env_file = ".env"
         extra = "ignore"
