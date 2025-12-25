@@ -20,6 +20,196 @@ logger = structlog.get_logger()
 # SendGrid client (lazy-loaded)
 _sendgrid_client = None
 
+# Firebase Admin SDK (lazy-loaded)
+_firebase_app = None
+
+
+def get_firebase_app():
+    """Get or initialize Firebase Admin SDK."""
+    global _firebase_app
+    if _firebase_app is not None:
+        return _firebase_app
+
+    if not settings.FIREBASE_CREDENTIALS_PATH and not settings.FIREBASE_PROJECT_ID:
+        logger.debug("Firebase not configured, push notifications will be logged only")
+        return None
+
+    try:
+        import firebase_admin
+        from firebase_admin import credentials
+
+        # Check if already initialized
+        try:
+            _firebase_app = firebase_admin.get_app()
+            return _firebase_app
+        except ValueError:
+            pass  # Not initialized yet
+
+        # Initialize with credentials file or default credentials
+        if settings.FIREBASE_CREDENTIALS_PATH:
+            cred = credentials.Certificate(settings.FIREBASE_CREDENTIALS_PATH)
+            _firebase_app = firebase_admin.initialize_app(cred)
+        else:
+            # Use Application Default Credentials (for GCP)
+            _firebase_app = firebase_admin.initialize_app()
+
+        logger.info("Firebase Admin SDK initialized")
+        return _firebase_app
+
+    except ImportError:
+        logger.warning("firebase-admin package not installed. Run: pip install firebase-admin")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to initialize Firebase: {e}")
+        return None
+
+
+def _send_push_notification_sync(
+    device_tokens: list,
+    title: str,
+    body: str,
+    data: dict = None,
+    image_url: str = None
+) -> dict:
+    """
+    Send push notification via Firebase Cloud Messaging.
+
+    Args:
+        device_tokens: List of FCM device tokens
+        title: Notification title
+        body: Notification body
+        data: Optional custom data payload
+        image_url: Optional image URL to display
+
+    Returns:
+        Dict with success status and details
+    """
+    app = get_firebase_app()
+    if not app:
+        # Log for development
+        logger.info(
+            "Push notification would be sent (Firebase not configured)",
+            title=title,
+            token_count=len(device_tokens),
+        )
+        return {"success": True, "sent": 0, "failed": 0, "pending_fcm": True}
+
+    try:
+        from firebase_admin import messaging
+
+        # Build notification
+        notification = messaging.Notification(
+            title=title,
+            body=body,
+            image=image_url,
+        )
+
+        # Build Android-specific config
+        android_config = messaging.AndroidConfig(
+            priority="high",
+            notification=messaging.AndroidNotification(
+                icon="ic_notification",
+                color="#6366F1",  # Primary color
+                sound="default",
+                click_action="FLUTTER_NOTIFICATION_CLICK",
+            ),
+        )
+
+        # Build iOS-specific config (APNs)
+        apns_config = messaging.APNSConfig(
+            payload=messaging.APNSPayload(
+                aps=messaging.Aps(
+                    alert=messaging.ApsAlert(
+                        title=title,
+                        body=body,
+                    ),
+                    sound="default",
+                    badge=1,
+                ),
+            ),
+        )
+
+        # Build web push config
+        web_push_config = messaging.WebpushConfig(
+            notification=messaging.WebpushNotification(
+                title=title,
+                body=body,
+                icon="/icon-192.png",
+            ),
+        )
+
+        # Send to multiple tokens
+        if len(device_tokens) == 1:
+            # Single message
+            message = messaging.Message(
+                notification=notification,
+                data=data or {},
+                token=device_tokens[0],
+                android=android_config,
+                apns=apns_config,
+                webpush=web_push_config,
+            )
+            response = messaging.send(message)
+            logger.info("Push notification sent", message_id=response)
+            return {"success": True, "sent": 1, "failed": 0, "message_id": response}
+        else:
+            # Multicast for multiple tokens
+            message = messaging.MulticastMessage(
+                notification=notification,
+                data=data or {},
+                tokens=device_tokens,
+                android=android_config,
+                apns=apns_config,
+                webpush=web_push_config,
+            )
+            response = messaging.send_each_for_multicast(message)
+
+            logger.info(
+                "Push notifications sent",
+                success_count=response.success_count,
+                failure_count=response.failure_count,
+            )
+
+            # Collect failed tokens for cleanup
+            failed_tokens = []
+            for idx, result in enumerate(response.responses):
+                if not result.success:
+                    failed_tokens.append(device_tokens[idx])
+
+            return {
+                "success": response.success_count > 0,
+                "sent": response.success_count,
+                "failed": response.failure_count,
+                "failed_tokens": failed_tokens,
+            }
+
+    except Exception as e:
+        logger.error(f"Failed to send push notification: {e}")
+        return {"success": False, "error": str(e)}
+
+
+async def _get_user_device_tokens(user_id: str) -> list:
+    """Fetch user's device tokens from database."""
+    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy import text
+
+    engine = create_async_engine(settings.DATABASE_URL)
+    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    async with async_session() as db:
+        result = await db.execute(
+            text("""
+                SELECT token FROM device_tokens
+                WHERE user_id = :user_id AND is_active = true
+            """),
+            {"user_id": user_id}
+        )
+        tokens = [row[0] for row in result.fetchall()]
+
+    await engine.dispose()
+    return tokens
+
 
 def get_sendgrid_client():
     """Get or create SendGrid client."""
@@ -146,28 +336,96 @@ def send_push_notification(
     title: str,
     body: str,
     data: Dict = None,
+    device_tokens: list = None,
+    image_url: str = None,
     trace_headers: Optional[Dict] = None
 ) -> Dict:
     """
-    Send push notification.
+    Send push notification via Firebase Cloud Messaging.
 
-    TODO: Implement Firebase Cloud Messaging (FCM) integration.
-    Currently logs the notification for development purposes.
+    Args:
+        user_id: Target user ID
+        title: Notification title
+        body: Notification body
+        data: Optional custom data payload (e.g., {"action": "open_pack", "pack_id": "..."})
+        device_tokens: Optional list of device tokens (if not provided, fetched from DB)
+        image_url: Optional image URL to display in notification
+        trace_headers: Trace context for distributed tracing
+
+    Returns:
+        Dict with success status, sent count, and any failed tokens
     """
     with trace_task("send_push_notification", trace_headers, {"user_id": user_id}) as span:
         add_task_attribute("title", title[:100])
         add_task_attribute("retry_count", self.request.retries)
 
-        # TODO: Implement FCM push notification
-        # For now, log the notification (no real push)
-        logger.info(
-            "Push notification (logged, FCM not configured)",
-            user_id=user_id,
-            title=title,
-            body=body,
-            data=data,
-        )
-        return {'success': True, 'user_id': user_id, 'pending_fcm': True}
+        try:
+            # Get device tokens if not provided
+            tokens = device_tokens
+            if not tokens:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    tokens = loop.run_until_complete(_get_user_device_tokens(user_id))
+                finally:
+                    loop.close()
+
+            if not tokens:
+                logger.debug("No device tokens found for user", user_id=user_id)
+                return {
+                    "success": True,
+                    "user_id": user_id,
+                    "sent": 0,
+                    "message": "No device tokens registered"
+                }
+
+            add_task_attribute("token_count", len(tokens))
+
+            # Ensure data values are strings (FCM requirement)
+            clean_data = {}
+            if data:
+                for key, value in data.items():
+                    clean_data[str(key)] = str(value) if value is not None else ""
+
+            # Send push notification
+            result = _send_push_notification_sync(
+                device_tokens=tokens,
+                title=title,
+                body=body,
+                data=clean_data,
+                image_url=image_url,
+            )
+
+            add_task_attribute("sent_count", result.get("sent", 0))
+            add_task_attribute("failed_count", result.get("failed", 0))
+
+            if result.get("success"):
+                logger.info(
+                    "Push notification sent",
+                    user_id=user_id,
+                    sent=result.get("sent", 0),
+                    failed=result.get("failed", 0),
+                )
+                return {
+                    "success": True,
+                    "user_id": user_id,
+                    **result
+                }
+            else:
+                raise Exception(result.get("error", "Unknown FCM error"))
+
+        except Exception as e:
+            logger.error(
+                "Push notification failed",
+                user_id=user_id,
+                error=str(e),
+                retry_count=self.request.retries
+            )
+            # Retry with exponential backoff
+            if self.request.retries < self.max_retries:
+                raise self.retry(exc=e, countdown=15 * (2 ** self.request.retries))
+
+            return {"success": False, "user_id": user_id, "error": str(e)}
 
 
 @app.task(bind=True, max_retries=5, default_retry_delay=60)

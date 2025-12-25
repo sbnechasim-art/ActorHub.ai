@@ -56,6 +56,10 @@ class WorkerSettings(BaseSettings):
     PAYOUT_PLATFORM_FEE_PERCENT: float = 20.0
     PAYOUT_AUTO_ENABLED: bool = True
 
+    # Firebase Cloud Messaging
+    FIREBASE_CREDENTIALS_PATH: str = ""  # Path to service account JSON
+    FIREBASE_PROJECT_ID: str = ""
+
     class Config:
         env_file = ".env"
         extra = "ignore"
