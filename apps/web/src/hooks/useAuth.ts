@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import { logger } from '@/lib/logger'
+import { useCartStore } from '@/store/cart'
 
 interface User {
   id: string
@@ -33,34 +34,38 @@ export function useAuth() {
 
   // Check if user is authenticated on mount
   useEffect(() => {
-    checkAuth()
+    const controller = new AbortController()
+    checkAuth(controller.signal)
+
+    return () => {
+      controller.abort()
+    }
   }, [])
 
-  const checkAuth = useCallback(async () => {
-    const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null
-
-    if (!token) {
-      setState({ user: null, isLoading: false, isAuthenticated: false })
-      return
-    }
-
+  const checkAuth = useCallback(async (signal?: AbortSignal) => {
+    // SECURITY: Tokens are stored in httpOnly cookies, not localStorage
+    // The cookie is sent automatically with credentials: 'include'
     try {
       const response = await fetch(`${API_URL}/users/me`, {
         headers: {
-          'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json',
         },
+        credentials: 'include', // Send httpOnly cookies
+        signal,
       })
 
       if (response.ok) {
         const user = await response.json()
         setState({ user, isLoading: false, isAuthenticated: true })
       } else {
-        // Token is invalid, clear it
-        localStorage.removeItem('token')
+        // Not authenticated or token expired
         setState({ user: null, isLoading: false, isAuthenticated: false })
       }
     } catch (error) {
+      // Ignore abort errors - component unmounted
+      if (error instanceof Error && error.name === 'AbortError') {
+        return
+      }
       logger.error('Auth check failed', error)
       setState({ user: null, isLoading: false, isAuthenticated: false })
     }
@@ -71,12 +76,14 @@ export function useAuth() {
       const response = await fetch(`${API_URL}/users/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include', // Receive httpOnly cookies
         body: JSON.stringify({ email, password }),
       })
 
       if (response.ok) {
         const data = await response.json()
-        localStorage.setItem('token', data.access_token)
+        // SECURITY: Token is stored in httpOnly cookie by the server
+        // No need to store in localStorage (which is vulnerable to XSS)
         setState({ user: data.user, isLoading: false, isAuthenticated: true })
         return { success: true }
       } else {
@@ -105,6 +112,7 @@ export function useAuth() {
       const response = await fetch(`${API_URL}/users/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify(data),
       })
 
@@ -126,8 +134,21 @@ export function useAuth() {
     }
   }, [])
 
-  const logout = useCallback(() => {
-    localStorage.removeItem('token')
+  const logout = useCallback(async () => {
+    // SECURITY: Call logout endpoint to clear httpOnly cookies on the server
+    try {
+      await fetch(`${API_URL}/users/logout`, {
+        method: 'POST',
+        credentials: 'include', // Send cookies so server can clear them
+      })
+    } catch (error) {
+      // Ignore logout errors - clear state anyway
+      logger.error('Logout request failed', error)
+    }
+
+    // Clear cart on logout - prevents cart data leaking between users
+    useCartStore.getState().clearCart()
+
     setState({ user: null, isLoading: false, isAuthenticated: false })
     router.push('/')
   }, [router])
