@@ -5,25 +5,38 @@ import { useRouter } from 'next/navigation'
 import { useMutation } from '@tanstack/react-query'
 import { useDropzone } from 'react-dropzone'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Camera, Upload, Check, Shield, ArrowLeft, ArrowRight, Loader2 } from 'lucide-react'
+import { Camera, Upload, Check, Shield, ArrowLeft, ArrowRight, Loader2, Video } from 'lucide-react'
 import Link from 'next/link'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { identityApi } from '@/lib/api'
 import { cn } from '@/lib/utils'
+import { logger } from '@/lib/logger'
+import { showErrorToast } from '@/lib/errors'
+import { validators, validateField } from '@/lib/validation'
+import { LiveSelfieCapture, LivenessMetadata } from '@/components/verification'
+import { CameraError } from '@/hooks/useCamera'
 
 type Step = 'upload' | 'verify' | 'settings' | 'complete'
 
 const STEPS = ['upload', 'verify', 'settings', 'complete'] as const
 
+interface SelfieData {
+  blob: Blob
+  base64: string
+  livenessMetadata: LivenessMetadata
+}
+
 export default function RegisterIdentityPage() {
   const router = useRouter()
   const [step, setStep] = useState<Step>('upload')
   const [faceImage, setFaceImage] = useState<File | null>(null)
-  const [verifyImage, setVerifyImage] = useState<File | null>(null)
   const [facePreview, setFacePreview] = useState<string | null>(null)
-  const [verifyPreview, setVerifyPreview] = useState<string | null>(null)
+
+  // Selfie data from camera capture
+  const [selfieData, setSelfieData] = useState<SelfieData | null>(null)
+  const [selfiePreview, setSelfiePreview] = useState<string | null>(null)
 
   // Manage object URLs properly to avoid memory leaks and DOM errors
   useEffect(() => {
@@ -37,31 +50,73 @@ export default function RegisterIdentityPage() {
   }, [faceImage])
 
   useEffect(() => {
-    if (verifyImage) {
-      const url = URL.createObjectURL(verifyImage)
-      setVerifyPreview(url)
+    if (selfieData) {
+      const url = URL.createObjectURL(selfieData.blob)
+      setSelfiePreview(url)
       return () => URL.revokeObjectURL(url)
     } else {
-      setVerifyPreview(null)
+      setSelfiePreview(null)
     }
-  }, [verifyImage])
+  }, [selfieData])
+
   const [settings, setSettings] = useState({
     displayName: '',
-    protectionLevel: 'free',
+    protectionLevel: 'FREE',
     allowCommercial: false,
     allowAiTraining: false,
+    showInPublicGallery: false,
     blockedCategories: [] as string[]
   })
 
+  // Validation errors
+  const [validationErrors, setValidationErrors] = useState<Record<string, string>>({})
+
+  // Validate display name
+  const validateDisplayName = (name: string): string | null => {
+    return validateField(name, [
+      validators.required('Display name'),
+      validators.minLength(2, 'Display name'),
+      validators.maxLength(50, 'Display name'),
+    ])
+  }
+
+  // Validate before submit
+  const validateForm = (): boolean => {
+    const errors: Record<string, string> = {}
+
+    const nameError = validateDisplayName(settings.displayName)
+    if (nameError) errors.displayName = nameError
+
+    if (!faceImage) errors.faceImage = 'Face photo is required'
+    if (!selfieData) errors.selfie = 'Verification selfie is required'
+
+    setValidationErrors(errors)
+    return Object.keys(errors).length === 0
+  }
+
   const registerMutation = useMutation({
     mutationFn: async () => {
+      // Validate before submitting
+      if (!validateForm()) {
+        throw new Error('Please fix the validation errors before submitting')
+      }
+
       const formData = new FormData()
       formData.append('face_image', faceImage!)
-      formData.append('verification_image', verifyImage!)
-      formData.append('display_name', settings.displayName)
+
+      // Convert selfie blob to File for FormData
+      const selfieFile = new File([selfieData!.blob], 'selfie.jpg', { type: 'image/jpeg' })
+      formData.append('verification_image', selfieFile)
+
+      formData.append('display_name', settings.displayName.trim())
       formData.append('protection_level', settings.protectionLevel)
       formData.append('allow_commercial', String(settings.allowCommercial))
       formData.append('allow_ai_training', String(settings.allowAiTraining))
+      formData.append('show_in_public_gallery', String(settings.showInPublicGallery))
+
+      // Add liveness metadata
+      formData.append('is_live_capture', 'true')
+      formData.append('liveness_metadata', JSON.stringify(selfieData!.livenessMetadata))
 
       return identityApi.register(formData)
     },
@@ -69,33 +124,14 @@ export default function RegisterIdentityPage() {
       setStep('complete')
       setTimeout(() => router.push('/dashboard'), 3000)
     },
-    onError: (error: any) => {
-      // Handle FastAPI validation errors (detail can be array of objects)
-      let errorMessage = 'Registration failed'
-      const detail = error.response?.data?.detail
-      const status = error.response?.status
-
-      if (status === 401) {
-        errorMessage = 'You must be logged in to register an identity. Please sign in first.'
-      } else if (typeof detail === 'string') {
-        errorMessage = detail
-      } else if (Array.isArray(detail) && detail.length > 0) {
-        errorMessage = detail.map((d: any) => d.msg || d.message || JSON.stringify(d)).join(', ')
-      } else if (error.message) {
-        errorMessage = error.message
-      }
-
-      console.error('Registration error:', { status, detail, error })
-      alert(errorMessage)
+    onError: (error: unknown) => {
+      logger.error('Registration error', error)
+      showErrorToast(error)
     }
   })
 
   const onDropFace = useCallback((files: File[]) => {
     if (files[0]) setFaceImage(files[0])
-  }, [])
-
-  const onDropVerify = useCallback((files: File[]) => {
-    if (files[0]) setVerifyImage(files[0])
   }, [])
 
   const faceDropzone = useDropzone({
@@ -105,12 +141,20 @@ export default function RegisterIdentityPage() {
     maxSize: 10 * 1024 * 1024
   })
 
-  const verifyDropzone = useDropzone({
-    onDrop: onDropVerify,
-    accept: { 'image/*': ['.jpg', '.jpeg', '.png'] },
-    maxFiles: 1,
-    maxSize: 10 * 1024 * 1024
-  })
+  // Handle selfie capture from camera
+  const handleSelfieCapture = useCallback((blob: Blob, base64: string, livenessMetadata: LivenessMetadata) => {
+    setSelfieData({ blob, base64, livenessMetadata })
+    setStep('settings')
+  }, [])
+
+  const handleSelfieCaptureError = useCallback((error: CameraError) => {
+    logger.error('Camera error', { error })
+    // Error is displayed in the LiveSelfieCapture component
+  }, [])
+
+  const handleSelfieCaptureCancel = useCallback(() => {
+    setStep('upload')
+  }, [])
 
   const currentStepIndex = STEPS.indexOf(step)
 
@@ -218,7 +262,7 @@ export default function RegisterIdentityPage() {
             </motion.div>
           )}
 
-          {/* Step 2: Verification Selfie */}
+          {/* Step 2: Live Selfie Verification */}
           {step === 'verify' && (
             <motion.div
               key="verify"
@@ -226,60 +270,68 @@ export default function RegisterIdentityPage() {
               animate={{ opacity: 1, x: 0 }}
               exit={{ opacity: 0, x: -20 }}
               transition={{ duration: 0.2 }}
-              className="text-center"
             >
-              <div className="w-16 h-16 rounded-full bg-green-500/20 flex items-center justify-center mx-auto mb-6">
-                <Shield className="w-8 h-8 text-green-400" />
-              </div>
-              <h1 className="text-2xl font-bold text-white mb-2">Verify It's You</h1>
-              <p className="text-slate-400 mb-8">
-                Take a selfie or upload a verification photo
-              </p>
-
-              <div
-                {...verifyDropzone.getRootProps()}
-                className={cn(
-                  'border-2 border-dashed rounded-xl p-12 cursor-pointer transition-colors',
-                  verifyDropzone.isDragActive
-                    ? 'border-green-500 bg-green-500/10'
-                    : 'border-slate-700 hover:border-slate-600'
-                )}
-              >
-                <input {...verifyDropzone.getInputProps()} />
-                {verifyImage && verifyPreview ? (
-                  <div className="flex flex-col items-center">
-                    <img
-                      src={verifyPreview}
-                      alt="Verification"
-                      className="w-48 h-48 object-cover rounded-xl mb-4"
-                    />
-                    <p className="text-green-400 flex items-center gap-2">
-                      <Check className="w-4 h-4" />
-                      Verification photo uploaded
-                    </p>
-                  </div>
-                ) : (
-                  <div className="flex flex-col items-center">
-                    <Camera className="w-12 h-12 text-slate-500 mb-4" />
-                    <p className="text-slate-400">Upload verification photo</p>
-                  </div>
-                )}
+              <div className="text-center mb-8">
+                <div className="w-16 h-16 rounded-full bg-green-500/20 flex items-center justify-center mx-auto mb-6">
+                  <Video className="w-8 h-8 text-green-400" />
+                </div>
+                <h1 className="text-2xl font-bold text-white mb-2">Take a Live Selfie</h1>
+                <p className="text-slate-400">
+                  We need to verify you're the person in the photo
+                </p>
               </div>
 
-              <div className="flex gap-4 justify-center mt-8">
-                <Button variant="outline" onClick={() => setStep('upload')}>
-                  <ArrowLeft className="w-5 h-5 mr-2" />
-                  Back
-                </Button>
+              {/* Side-by-side comparison if selfie already taken */}
+              {selfieData && selfiePreview ? (
+                <div className="mb-8">
+                  <div className="grid grid-cols-2 gap-6 mb-6">
+                    <div className="text-center">
+                      <p className="text-slate-400 text-sm mb-2">Your Photo</p>
+                      <img
+                        src={facePreview!}
+                        alt="Reference"
+                        className="w-full aspect-square object-cover rounded-xl"
+                      />
+                    </div>
+                    <div className="text-center">
+                      <p className="text-slate-400 text-sm mb-2">Live Selfie</p>
+                      <img
+                        src={selfiePreview}
+                        alt="Selfie"
+                        className="w-full aspect-square object-cover rounded-xl"
+                      />
+                    </div>
+                  </div>
+                  <div className="flex gap-4 justify-center">
+                    <Button variant="outline" onClick={() => setSelfieData(null)}>
+                      Retake Selfie
+                    </Button>
+                    <Button variant="gradient" onClick={() => setStep('settings')}>
+                      Continue
+                      <ArrowRight className="w-5 h-5 ml-2" />
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <LiveSelfieCapture
+                  onCapture={handleSelfieCapture}
+                  onError={handleSelfieCaptureError}
+                  onCancel={handleSelfieCaptureCancel}
+                  enableLivenessCheck={true}
+                />
+              )}
+
+              {/* Back button when in camera mode */}
+              {!selfieData && (
                 <Button
-                  onClick={() => setStep('settings')}
-                  disabled={!verifyImage}
-                  variant="gradient"
+                  variant="ghost"
+                  onClick={() => setStep('upload')}
+                  className="mt-4 w-full text-slate-400"
                 >
-                  Continue
-                  <ArrowRight className="w-5 h-5 ml-2" />
+                  <ArrowLeft className="w-5 h-5 mr-2" />
+                  Back to Photo Upload
                 </Button>
-              </div>
+              )}
             </motion.div>
           )}
 
@@ -296,6 +348,29 @@ export default function RegisterIdentityPage() {
                 Protection Settings
               </h1>
 
+              {/* Photo comparison summary */}
+              <div className="grid grid-cols-2 gap-4 mb-8">
+                <div className="bg-slate-800/50 rounded-xl p-4 text-center">
+                  <img
+                    src={facePreview!}
+                    alt="Reference"
+                    className="w-24 h-24 object-cover rounded-lg mx-auto mb-2"
+                  />
+                  <p className="text-slate-400 text-sm">Reference Photo</p>
+                </div>
+                <div className="bg-slate-800/50 rounded-xl p-4 text-center">
+                  <img
+                    src={selfiePreview!}
+                    alt="Selfie"
+                    className="w-24 h-24 object-cover rounded-lg mx-auto mb-2"
+                  />
+                  <p className="text-slate-400 text-sm flex items-center justify-center gap-1">
+                    <Check className="w-4 h-4 text-green-400" />
+                    Live Selfie
+                  </p>
+                </div>
+              </div>
+
               <Card className="bg-slate-800/50 border-slate-700">
                 <CardContent className="p-6 space-y-6">
                   <div>
@@ -304,10 +379,22 @@ export default function RegisterIdentityPage() {
                     </label>
                     <Input
                       value={settings.displayName}
-                      onChange={(e) => setSettings({ ...settings, displayName: e.target.value })}
+                      onChange={(e) => {
+                        setSettings({ ...settings, displayName: e.target.value })
+                        // Clear error on change
+                        if (validationErrors.displayName) {
+                          setValidationErrors(prev => ({ ...prev, displayName: '' }))
+                        }
+                      }}
                       placeholder="How you want to be identified"
-                      className="bg-slate-900 border-slate-700"
+                      className={cn(
+                        "bg-slate-900 border-slate-700",
+                        validationErrors.displayName && "border-red-500 focus:border-red-500"
+                      )}
                     />
+                    {validationErrors.displayName && (
+                      <p className="text-red-400 text-sm mt-1">{validationErrors.displayName}</p>
+                    )}
                   </div>
 
                   <div>
@@ -315,7 +402,7 @@ export default function RegisterIdentityPage() {
                       Protection Level
                     </label>
                     <div className="grid grid-cols-3 gap-3">
-                      {['free', 'pro', 'enterprise'].map((level) => (
+                      {['FREE', 'PRO', 'ENTERPRISE'].map((level) => (
                         <button
                           key={level}
                           onClick={() => setSettings({ ...settings, protectionLevel: level })}
@@ -326,7 +413,7 @@ export default function RegisterIdentityPage() {
                               : 'border-slate-700 text-slate-400 hover:border-slate-600'
                           )}
                         >
-                          {level}
+                          {level.toLowerCase()}
                         </button>
                       ))}
                     </div>
@@ -354,6 +441,18 @@ export default function RegisterIdentityPage() {
                       />
                       <span className="text-slate-300">
                         Allow AI training (your data may be used to improve AI models)
+                      </span>
+                    </label>
+
+                    <label className="flex items-center gap-3 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={settings.showInPublicGallery}
+                        onChange={(e) => setSettings({ ...settings, showInPublicGallery: e.target.checked })}
+                        className="w-5 h-5 rounded border-slate-700 bg-slate-900"
+                      />
+                      <span className="text-slate-300">
+                        Show my verified image in public gallery
                       </span>
                     </label>
                   </div>

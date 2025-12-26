@@ -1,0 +1,63 @@
+● מעולה, אני אכתוב סקריפט שמפעיל את כל הפלטפורמה בלחיצה אחת:
+
+● Write(start-platform.bat)
+  ⎿  Wrote 1 lines to start-platform.bat
+     @echo off
+     chcp 65001 >nul
+     title ActorHub.ai Platform Launcher
+     echo.
+     echo  ╔═══════════════════════════════════════════════════════════╗
+     echo  ║           ActorHub.ai Platform Launcher                   ║
+     echo  ║                                                           ║
+     echo  ║   Starting all services...                                ║
+     echo  ╚═══════════════════════════════════════════════════════════╝
+
+● Write(stop-platform.bat)
+  ⎿  Wrote 1 lines to stop-platform.bat
+     @echo off
+     chcp 65001 >nul
+     title ActorHub.ai Platform Shutdown
+     echo.
+     echo  ╔═══════════════════════════════════════════════════════════╗
+     echo  ║           ActorHub.ai Platform Shutdown                   ║
+     echo  ╚═══════════════════════════════════════════════════════════╝
+     echo.
+
+● Write(restart-api.bat)
+  ⎿  Wrote 1 lines to restart-api.bat
+     @echo off
+     chcp 65001 >nul
+     title Restart ActorHub API
+     echo Restarting API server...
+     :: Kill existing API
+     taskkill /F /FI "WINDOWTITLE eq ActorHub API*" >nul 2>&1
+     timeout /t 2 /nobreak >nul
+
+● נוצרו 3 סקריפטים:
+
+  | קובץ               | תפקיד                      |
+  |--------------------|----------------------------|
+  | start-platform.bat | 🚀 מפעיל את הכל בלחיצה אחת |
+  | stop-platform.bat  | 🛑 עוצר את כל השירותים     |
+  | restart-api.bat    | 🔄 מפעיל מחדש רק את ה-API  |
+
+  ---
+  מה start-platform.bat עושה:
+
+  1. ✅ Docker containers (PostgreSQL, Redis, MinIO, Qdrant)
+  2. ✅ ngrok tunnel + עדכון אוטומטי של .env
+  3. ✅ Celery Worker
+  4. ✅ API Server (FastAPI)
+  5. ✅ Web Frontend (Next.js)
+
+  ---
+  להפעלה:
+
+  לחיצה כפולה על: start-platform.bat
+
+  או מה-terminal:
+  cd "C:\ActorHub.ai 1.1"
+  start-platform.bat
+
+  ---
+  רוצה שאפעיל את זה עכשיו?

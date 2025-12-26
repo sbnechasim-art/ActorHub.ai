@@ -53,7 +53,7 @@ def verify_replicate_setup():
 
         models_to_check = [
             ("ostris/flux-dev-lora-trainer", "LoRA face training"),
-            ("cjwbw/xtts-v2", "Voice cloning (XTTS)"),
+            ("lucataco/xtts-v2", "Voice cloning (XTTS)"),
         ]
 
         for model_name, description in models_to_check:

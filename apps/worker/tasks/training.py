@@ -2,11 +2,12 @@
 Actor Pack Training Tasks
 
 Uses the shared database pool and real training service from the API.
+Includes distributed tracing for end-to-end visibility.
 """
 import sys
 import os
 from typing import List, Dict, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 import structlog
 
@@ -18,6 +19,7 @@ if API_PATH not in sys.path:
 from celery_app import app
 from config import settings
 from db import get_db_session, run_async
+from tracing import trace_task, get_trace_headers_for_subtask, add_task_attribute
 
 logger = structlog.get_logger()
 
@@ -28,41 +30,61 @@ def train_actor_pack(
     actor_pack_id: str,
     image_urls: List[str],
     audio_urls: Optional[List[str]] = None,
-    video_urls: Optional[List[str]] = None
+    video_urls: Optional[List[str]] = None,
+    trace_headers: Optional[Dict] = None
 ) -> Dict:
     """
     Train a complete Actor Pack.
 
     This task orchestrates the entire training pipeline using the
     real TrainingService from the API.
+
+    Args:
+        actor_pack_id: Unique identifier for the Actor Pack
+        image_urls: List of face image URLs for training
+        audio_urls: Optional list of voice sample URLs
+        video_urls: Optional list of video URLs for motion capture
+        trace_headers: Trace context headers for distributed tracing
     """
-    logger.info(f"Starting Actor Pack training: {actor_pack_id}")
+    with trace_task("train_actor_pack", trace_headers, {
+        "actor_pack_id": actor_pack_id,
+        "image_count": len(image_urls),
+        "has_audio": bool(audio_urls),
+        "has_video": bool(video_urls),
+    }) as span:
+        try:
+            add_task_attribute("retry_count", self.request.retries)
 
-    try:
-        result = run_async(
-            _async_train_actor_pack(
-                actor_pack_id=actor_pack_id,
-                image_urls=image_urls,
-                audio_urls=audio_urls,
-                video_urls=video_urls,
-                task=self
+            result = run_async(
+                _async_train_actor_pack(
+                    actor_pack_id=actor_pack_id,
+                    image_urls=image_urls,
+                    audio_urls=audio_urls,
+                    video_urls=video_urls,
+                    task=self
+                )
             )
-        )
 
-        return result
+            add_task_attribute("quality_score", result.get("quality_score", 0))
+            return result
 
-    except Exception as e:
-        logger.error(f"Training failed: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(
+                "Training failed",
+                actor_pack_id=actor_pack_id,
+                error=str(e),
+                retry_count=self.request.retries
+            )
 
-        # Update database with failure status
-        run_async(_mark_training_failed(actor_pack_id, str(e)))
+            # Update database with failure status
+            run_async(_mark_training_failed(actor_pack_id, str(e)))
 
-        self.update_state(state='FAILURE', meta={'error': str(e)})
+            self.update_state(state='FAILURE', meta={'error': str(e)})
 
-        # Retry with exponential backoff
-        if self.request.retries < self.max_retries:
-            raise self.retry(exc=e, countdown=300 * (2 ** self.request.retries))
-        raise
+            # Retry with exponential backoff
+            if self.request.retries < self.max_retries:
+                raise self.retry(exc=e, countdown=300 * (2 ** self.request.retries))
+            raise
 
 
 async def _async_train_actor_pack(
@@ -102,7 +124,7 @@ async def _async_train_actor_pack(
 
         # Update status to processing
         actor_pack.training_status = TrainingStatus.PROCESSING
-        actor_pack.training_started_at = datetime.utcnow()
+        actor_pack.training_started_at = datetime.now(timezone.utc)
         actor_pack.training_progress = 0
         await db.commit()
 
@@ -163,7 +185,7 @@ async def _async_train_actor_pack(
 
             # Update actor pack with results
             actor_pack.training_status = TrainingStatus.COMPLETED
-            actor_pack.training_completed_at = datetime.utcnow()
+            actor_pack.training_completed_at = datetime.now(timezone.utc)
             actor_pack.training_progress = 100
             actor_pack.s3_bucket = settings.S3_BUCKET_ACTOR_PACKS if hasattr(settings, 'S3_BUCKET_ACTOR_PACKS') else 'actorhub-actor-packs'
             actor_pack.s3_key = pack_result["s3_key"]

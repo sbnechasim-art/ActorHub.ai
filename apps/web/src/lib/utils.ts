@@ -51,3 +51,31 @@ export function getInitials(name: string) {
     .toUpperCase()
     .slice(0, 2)
 }
+
+/**
+ * Convert MinIO/S3 image URLs to proxied URLs that work from any client.
+ * This handles localhost URLs that wouldn't be accessible from remote browsers.
+ *
+ * @param url The original image URL (e.g., http://localhost:9000/bucket/image.jpg)
+ * @returns Proxied URL through the Next.js API or the original URL if already accessible
+ */
+export function getProxiedImageUrl(url: string | null | undefined): string | undefined {
+  if (!url) return undefined
+
+  // If it's already an external URL (like Unsplash), return as-is
+  if (
+    url.startsWith('https://images.unsplash.com') ||
+    url.startsWith('https://randomuser.me') ||
+    url.startsWith('data:')
+  ) {
+    return url
+  }
+
+  // If it's a localhost/127.0.0.1 URL, proxy it through our API
+  if (url.includes('localhost') || url.includes('127.0.0.1')) {
+    return `/api/images?url=${encodeURIComponent(url)}`
+  }
+
+  // For other URLs (like production S3), return as-is
+  return url
+}

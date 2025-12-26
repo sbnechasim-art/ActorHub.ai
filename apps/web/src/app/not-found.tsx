@@ -19,7 +19,7 @@ export default function NotFound() {
         </div>
 
         {/* Message */}
-        <h1 className="text-3xl font-bold text-white mb-4">
+        <h1 className="text-3xl font-bold text-white mb-4" suppressHydrationWarning>
           Page Not Found
         </h1>
         <p className="text-slate-400 mb-8 text-lg">

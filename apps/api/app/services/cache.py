@@ -7,16 +7,20 @@ Enterprise-grade caching layer with:
 - Cache invalidation patterns
 - Connection pooling
 - Fallback handling
+- Timeout configuration
+- Retry logic for transient failures
 """
 
+import asyncio
 import hashlib
 import json
+import time
 from functools import wraps
 from typing import Any, Callable, Optional, TypeVar, Union
 
 import structlog
 from redis import asyncio as aioredis
-from redis.exceptions import RedisError
+from redis.exceptions import RedisError, TimeoutError as RedisTimeoutError
 
 from app.core.config import settings
 
@@ -24,12 +28,20 @@ logger = structlog.get_logger()
 
 T = TypeVar("T")
 
+# Timeout configuration
+REDIS_CONNECT_TIMEOUT = 5.0  # Connection timeout in seconds
+REDIS_SOCKET_TIMEOUT = 2.0  # Operation timeout in seconds
+REDIS_RETRY_ATTEMPTS = 3
+REDIS_RETRY_DELAY = 0.5  # Base delay for retries
+
 
 class CacheService:
-    """Redis-based caching service"""
+    """Redis-based caching service with resilience patterns"""
 
     _instance: Optional["CacheService"] = None
     _redis: Optional[aioredis.Redis] = None
+    _connection_attempts: int = 0
+    _last_connection_error: Optional[str] = None
 
     def __new__(cls) -> "CacheService":
         if cls._instance is None:
@@ -37,20 +49,50 @@ class CacheService:
         return cls._instance
 
     async def connect(self) -> None:
-        """Initialize Redis connection"""
-        if self._redis is None:
+        """Initialize Redis connection with retry logic"""
+        if self._redis is not None:
+            return
+
+        last_error = None
+        for attempt in range(1, REDIS_RETRY_ATTEMPTS + 1):
             try:
                 self._redis = await aioredis.from_url(
                     settings.REDIS_URL,
                     encoding="utf-8",
                     decode_responses=True,
                     max_connections=20,
+                    socket_connect_timeout=REDIS_CONNECT_TIMEOUT,
+                    socket_timeout=REDIS_SOCKET_TIMEOUT,
+                    retry_on_timeout=True,
                 )
-                await self._redis.ping()
-                logger.info("Cache service connected to Redis")
-            except RedisError as e:
-                logger.warning("Redis connection failed, caching disabled", error=str(e))
-                self._redis = None
+                # Verify connection with timeout
+                await asyncio.wait_for(self._redis.ping(), timeout=REDIS_CONNECT_TIMEOUT)
+                self._connection_attempts = attempt
+                logger.info(
+                    "Cache service connected to Redis",
+                    attempt=attempt,
+                    timeout_config={
+                        "connect": REDIS_CONNECT_TIMEOUT,
+                        "socket": REDIS_SOCKET_TIMEOUT,
+                    },
+                )
+                return
+            except (RedisError, asyncio.TimeoutError, OSError) as e:
+                last_error = e
+                self._last_connection_error = str(e)
+                logger.warning(
+                    f"Redis connection attempt {attempt}/{REDIS_RETRY_ATTEMPTS} failed",
+                    error=str(e),
+                )
+                if attempt < REDIS_RETRY_ATTEMPTS:
+                    await asyncio.sleep(REDIS_RETRY_DELAY * attempt)
+
+        logger.warning(
+            "Redis connection failed after all retries, caching disabled",
+            error=str(last_error),
+            attempts=REDIS_RETRY_ATTEMPTS,
+        )
+        self._redis = None
 
     async def close(self) -> None:
         """Close Redis connection"""
@@ -107,19 +149,50 @@ class CacheService:
             logger.warning("Cache delete failed", key=key, error=str(e))
             return False
 
-    async def delete_pattern(self, pattern: str) -> int:
-        """Delete all keys matching pattern"""
+    async def delete_pattern(self, pattern: str, batch_size: int = 100, max_keys: int = 10000) -> int:
+        """
+        Delete all keys matching pattern with batching and limits.
+
+        HIGH FIX: Added batching and max_keys limit to prevent timeout on large keysets.
+        Uses SCAN with count hint for efficient iteration.
+        """
         if not self._redis:
             return 0
         try:
-            keys = []
-            async for key in self._redis.scan_iter(match=pattern):
-                keys.append(key)
-            if keys:
-                return await self._redis.delete(*keys)
-            return 0
+            deleted_count = 0
+            keys_processed = 0
+
+            # Use SCAN with count hint for batching
+            async for key in self._redis.scan_iter(match=pattern, count=batch_size):
+                keys_processed += 1
+
+                # Safety limit to prevent runaway deletion
+                if keys_processed > max_keys:
+                    logger.warning(
+                        "Cache delete_pattern hit max_keys limit",
+                        pattern=pattern,
+                        max_keys=max_keys,
+                        deleted=deleted_count,
+                    )
+                    break
+
+                # Delete in batches for efficiency
+                try:
+                    result = await asyncio.wait_for(
+                        self._redis.delete(key),
+                        timeout=REDIS_SOCKET_TIMEOUT
+                    )
+                    deleted_count += result
+                except asyncio.TimeoutError:
+                    logger.warning("Cache delete timeout for key", key=key[:50])
+                    continue
+
+            return deleted_count
         except RedisError as e:
             logger.warning("Cache delete pattern failed", pattern=pattern, error=str(e))
+            return 0
+        except asyncio.TimeoutError:
+            logger.warning("Cache delete_pattern scan timeout", pattern=pattern)
             return 0
 
     async def exists(self, key: str) -> bool:

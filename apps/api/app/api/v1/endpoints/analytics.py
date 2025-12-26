@@ -9,66 +9,30 @@ from uuid import UUID
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
 from sqlalchemy import select, func, and_, extract
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.helpers import utc_now  # MEDIUM FIX: Use timezone-aware datetime
 from app.core.security import get_current_user
 from app.models.identity import Identity, ActorPack, UsageLog
 from app.models.marketplace import License, Transaction
 from app.models.user import User, UserRole
+from app.schemas.analytics import (
+    TimeSeriesPoint,
+    UsageStats,
+    RevenueStats,
+    IdentityAnalytics,
+    DashboardAnalytics,
+)
 
 logger = structlog.get_logger()
 router = APIRouter()
 
 
-class TimeSeriesPoint(BaseModel):
-    """Single point in time series"""
-    date: str
-    value: float
-
-
-class UsageStats(BaseModel):
-    """Usage statistics"""
-    total_verifications: int
-    total_generations: int
-    total_api_calls: int
-    period_start: datetime
-    period_end: datetime
-
-
-class RevenueStats(BaseModel):
-    """Revenue statistics"""
-    total_revenue: float
-    total_payouts: float
-    net_earnings: float
-    transaction_count: int
-    currency: str
-
-
-class IdentityAnalytics(BaseModel):
-    """Analytics for a single identity"""
-    identity_id: UUID
-    identity_name: str
-    verifications: int
-    generations: int
-    licenses_sold: int
-    revenue: float
-
-
-class DashboardAnalytics(BaseModel):
-    """Complete dashboard analytics"""
-    usage: UsageStats
-    revenue: RevenueStats
-    top_identities: List[IdentityAnalytics]
-    usage_trend: List[TimeSeriesPoint]
-    revenue_trend: List[TimeSeriesPoint]
-
-
 async def require_admin(current_user: User = Depends(get_current_user)) -> User:
     """Dependency that requires admin role"""
-    if current_user.role != UserRole.ADMIN:
+    if current_user.role != "ADMIN":
         raise HTTPException(status_code=403, detail="Admin access required")
     return current_user
 
@@ -84,8 +48,8 @@ async def get_dashboard_analytics(
 
     Includes usage stats, revenue, top identities, and trends.
     """
-    period_start = datetime.utcnow() - timedelta(days=days)
-    period_end = datetime.utcnow()
+    period_start = utc_now() - timedelta(days=days)
+    period_end = utc_now()
 
     # Get usage stats
     usage = await _get_usage_stats(db, current_user.id, period_start, period_end)
@@ -119,7 +83,7 @@ async def get_usage_analytics(
     db: AsyncSession = Depends(get_db),
 ):
     """Get detailed usage analytics"""
-    period_start = datetime.utcnow() - timedelta(days=days)
+    period_start = utc_now() - timedelta(days=days)
 
     query = select(
         UsageLog.action,
@@ -177,7 +141,7 @@ async def get_revenue_analytics(
     db: AsyncSession = Depends(get_db),
 ):
     """Get detailed revenue analytics"""
-    period_start = datetime.utcnow() - timedelta(days=days)
+    period_start = utc_now() - timedelta(days=days)
 
     # Revenue by day
     daily_revenue = await db.execute(
@@ -251,7 +215,7 @@ async def get_identity_analytics(
     if identity.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    period_start = datetime.utcnow() - timedelta(days=days)
+    period_start = utc_now() - timedelta(days=days)
 
     # Usage stats
     usage_stats = await db.execute(
@@ -310,7 +274,7 @@ async def get_platform_analytics(
     db: AsyncSession = Depends(get_db),
 ):
     """Get platform-wide analytics (admin only)"""
-    period_start = datetime.utcnow() - timedelta(days=days)
+    period_start = utc_now() - timedelta(days=days)
 
     # Total users
     total_users = await db.scalar(select(func.count()).select_from(User)) or 0
@@ -463,45 +427,54 @@ async def _get_top_identities(
     period_start: datetime,
     limit: int = 5,
 ) -> List[IdentityAnalytics]:
-    """Get top performing identities"""
+    """Get top performing identities - optimized with single query"""
+    # Create subqueries for license stats to avoid N+1 queries
+    license_stats = (
+        select(
+            License.identity_id,
+            func.count(License.id).label("license_count"),
+            func.coalesce(func.sum(License.price_usd), 0).label("total_revenue"),
+        )
+        .group_by(License.identity_id)
+        .subquery()
+    )
+
+    # Single query with all data
     result = await db.execute(
         select(
             Identity.id,
             Identity.display_name,
             func.count(UsageLog.id).label("usage_count"),
-        ).outerjoin(
-            UsageLog, UsageLog.identity_id == Identity.id
-        ).where(
+            func.coalesce(license_stats.c.license_count, 0).label("licenses_sold"),
+            func.coalesce(license_stats.c.total_revenue, 0).label("revenue"),
+        )
+        .outerjoin(UsageLog, UsageLog.identity_id == Identity.id)
+        .outerjoin(license_stats, license_stats.c.identity_id == Identity.id)
+        .where(
             Identity.user_id == user_id,
             Identity.deleted_at.is_(None),
-        ).group_by(
-            Identity.id, Identity.display_name
-        ).order_by(
-            func.count(UsageLog.id).desc()
-        ).limit(limit)
+        )
+        .group_by(
+            Identity.id,
+            Identity.display_name,
+            license_stats.c.license_count,
+            license_stats.c.total_revenue,
+        )
+        .order_by(func.count(UsageLog.id).desc())
+        .limit(limit)
     )
 
-    identities = []
-    for row in result.all():
-        # Get additional stats for each identity
-        license_count = await db.scalar(
-            select(func.count()).where(License.identity_id == row.id)
-        ) or 0
-
-        revenue = await db.scalar(
-            select(func.sum(License.price_usd)).where(License.identity_id == row.id)
-        ) or 0
-
-        identities.append(IdentityAnalytics(
+    return [
+        IdentityAnalytics(
             identity_id=row.id,
             identity_name=row.display_name or "Unnamed",
             verifications=row.usage_count,
             generations=0,  # Would need action type filtering
-            licenses_sold=license_count,
-            revenue=float(revenue),
-        ))
-
-    return identities
+            licenses_sold=row.licenses_sold,
+            revenue=float(row.revenue),
+        )
+        for row in result.all()
+    ]
 
 
 async def _get_usage_trend(

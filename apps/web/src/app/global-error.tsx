@@ -7,6 +7,7 @@
  */
 
 import { useEffect } from 'react'
+import { logger } from '@/lib/logger'
 
 export default function GlobalError({
   error,
@@ -17,7 +18,7 @@ export default function GlobalError({
 }) {
   useEffect(() => {
     // Log to error reporting service (e.g., Sentry)
-    console.error('Global error:', error)
+    logger.error('Global error', error, { digest: error.digest })
 
     // Report to analytics
     if (typeof window !== 'undefined' && (window as any).gtag) {

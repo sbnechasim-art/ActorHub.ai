@@ -8,10 +8,12 @@ from app.api.v1.endpoints import (
     analytics,
     auth_extended,
     gdpr,
+    generation,
     health,
     identity,
     marketplace,
     notifications,
+    oauth,
     refunds,
     subscriptions,
     users,
@@ -24,11 +26,15 @@ router = APIRouter()
 router.include_router(identity.router, prefix="/identity", tags=["Identity"])
 router.include_router(users.router, prefix="/users", tags=["Users"])
 router.include_router(marketplace.router, prefix="/marketplace", tags=["Marketplace"])
-router.include_router(actor_packs.router, prefix="/actor-pack", tags=["Actor Packs"])
+router.include_router(actor_packs.router, prefix="/actor-packs", tags=["Actor Packs"])
+router.include_router(generation.router, prefix="/generate", tags=["Content Generation"])
 router.include_router(webhooks.router, prefix="/webhooks", tags=["Webhooks"])
 
 # Auth extended (2FA, password reset, email verification)
 router.include_router(auth_extended.router, prefix="/auth", tags=["Authentication"])
+
+# OAuth (Google, GitHub)
+router.include_router(oauth.router, prefix="/oauth", tags=["OAuth"])
 
 # Analytics & Reporting
 router.include_router(analytics.router, prefix="/analytics", tags=["Analytics"])

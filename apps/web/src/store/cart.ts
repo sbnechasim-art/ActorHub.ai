@@ -4,6 +4,7 @@ import { persist } from 'zustand/middleware'
 export interface CartItem {
   id: string
   actorId: string
+  identityId: string
   actorName: string
   actorImage: string
   tierName: string

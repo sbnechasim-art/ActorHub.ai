@@ -1,15 +1,37 @@
 """
 Database Configuration
 Async SQLAlchemy setup with PostgreSQL + pgvector
+
+Features:
+- Connection pooling with health checks
+- Retry logic for transient failures
+- Query timeout protection
+- Proper error handling and rollback
 """
 
+import asyncio
+import time
 from typing import AsyncGenerator
 
-from sqlalchemy import MetaData
+import structlog
+from sqlalchemy import MetaData, event
+from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
 from app.core.config import settings
+
+logger = structlog.get_logger()
+
+# Retry configuration for transient database errors
+DB_RETRY_ATTEMPTS = 3
+DB_RETRY_DELAY = 0.5  # Base delay in seconds
+DB_RETRYABLE_ERRORS = (
+    OperationalError,
+    InterfaceError,
+    ConnectionRefusedError,
+    TimeoutError,
+)
 
 # Naming convention for constraints
 naming_convention = {
@@ -53,17 +75,66 @@ async_session_maker = async_sessionmaker(
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """
-    Dependency for getting database sessions.
+    Dependency for getting database sessions with retry logic.
 
     Handles:
     - Automatic commit on success
     - Automatic rollback on exceptions
     - Proper connection cleanup
     - Timeout handling
+    - Retry for transient connection errors
     """
-    import structlog
-    logger = structlog.get_logger()
+    last_error = None
 
+    for attempt in range(1, DB_RETRY_ATTEMPTS + 1):
+        try:
+            async with async_session_maker() as session:
+                try:
+                    yield session
+                    await session.commit()
+                    return  # Success, exit the retry loop
+                except DB_RETRYABLE_ERRORS as e:
+                    await session.rollback()
+                    raise  # Re-raise to trigger retry
+                except Exception as e:
+                    await session.rollback()
+                    logger.error(
+                        "Database session error - rolled back",
+                        error=str(e),
+                        error_type=type(e).__name__,
+                    )
+                    raise
+                finally:
+                    await session.close()
+
+        except DB_RETRYABLE_ERRORS as e:
+            last_error = e
+            if attempt < DB_RETRY_ATTEMPTS:
+                delay = DB_RETRY_DELAY * (2 ** (attempt - 1))  # Exponential backoff
+                logger.warning(
+                    f"Database connection error, retrying in {delay}s",
+                    attempt=attempt,
+                    max_attempts=DB_RETRY_ATTEMPTS,
+                    error=str(e),
+                )
+                await asyncio.sleep(delay)
+            else:
+                logger.error(
+                    "Database connection failed after all retries",
+                    attempts=DB_RETRY_ATTEMPTS,
+                    error=str(e),
+                )
+                raise
+
+    if last_error:
+        raise last_error
+
+
+async def get_db_no_retry() -> AsyncGenerator[AsyncSession, None]:
+    """
+    Get database session without retry logic.
+    Use for operations where retry could cause issues (e.g., long transactions).
+    """
     async with async_session_maker() as session:
         try:
             yield session

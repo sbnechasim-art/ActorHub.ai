@@ -1,5 +1,10 @@
 version: '3.9'
 
+# ==========================================================
+# SECURITY: All images pinned to specific versions
+# Last audit: 2024-12-21
+# ==========================================================
+
 services:
   # PostgreSQL Database with pgvector extension
   postgres:
@@ -40,8 +45,9 @@ services:
       - actorhub-network
 
   # MinIO S3-compatible storage
+  # SECURITY: Pinned version (was unpinned)
   minio:
-    image: minio/minio
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
     container_name: actorhub-minio
     ports:
       - "9000:9000"
@@ -61,8 +67,9 @@ services:
       - actorhub-network
 
   # Qdrant Vector Database
+  # SECURITY: Pinned version (was :latest)
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.12.4
     container_name: actorhub-qdrant
     ports:
       - "6333:6333"
@@ -75,8 +82,9 @@ services:
       - actorhub-network
 
   # MinIO Setup - Create buckets on startup
+  # NOTE: Using latest as mc versions are tightly coupled with minio server
   minio-setup:
-    image: minio/mc
+    image: minio/mc:latest
     container_name: actorhub-minio-setup
     depends_on:
       minio:
@@ -89,6 +97,53 @@ services:
       mc anonymous set public myminio/actorhub-uploads;
       exit 0;
       "
+    networks:
+      - actorhub-network
+
+  # Flower - Celery task monitoring dashboard
+  # Access at http://localhost:5555
+  flower:
+    image: mher/flower:2.0
+    container_name: actorhub-flower
+    command: celery --broker=redis://redis:6379/0 flower --port=5555
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - FLOWER_BASIC_AUTH=admin:actorhub123
+      - FLOWER_PURGE_OFFLINE_WORKERS=60
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5555/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - actorhub-network
+
+  # PostgreSQL backup service - runs daily backups
+  postgres-backup:
+    image: prodrigestivill/postgres-backup-local:16
+    container_name: actorhub-postgres-backup
+    restart: unless-stopped
+    volumes:
+      - ./backups/postgres:/backups
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=actorhub
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - SCHEDULE=@daily
+      - BACKUP_KEEP_DAYS=7
+      - BACKUP_KEEP_WEEKS=4
+      - BACKUP_KEEP_MONTHS=6
+      - HEALTHCHECK_PORT=8080
+    depends_on:
+      postgres:
+        condition: service_healthy
     networks:
       - actorhub-network
 

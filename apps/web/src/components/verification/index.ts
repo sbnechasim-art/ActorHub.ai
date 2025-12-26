@@ -1,0 +1,6 @@
+export { LiveSelfieCapture } from './LiveSelfieCapture'
+export type { LiveSelfieCaptureProps, LivenessMetadata, CameraState } from './LiveSelfieCapture'
+export { CameraPreview, CameraPreviewWithRef } from './CameraPreview'
+export { CameraPermissionRequest } from './CameraPermissionRequest'
+export { CaptureConfirmation } from './CaptureConfirmation'
+export { FaceGuideOverlay } from './FaceGuideOverlay'

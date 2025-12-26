@@ -1,0 +1,106 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: actorhub-worker
+  namespace: actorhub
+  labels:
+    app: actorhub-worker
+    app.kubernetes.io/name: actorhub-worker
+    app.kubernetes.io/component: worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: actorhub-worker
+  template:
+    metadata:
+      labels:
+        app: actorhub-worker
+    spec:
+      containers:
+        - name: worker
+          image: ghcr.io/actorhub/worker:latest
+          command: ["celery", "-A", "celery_app", "worker", "-l", "info", "-Q", "training,face,notifications,cleanup,payouts"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: actorhub-secrets
+                  key: database-url
+            - name: CELERY_BROKER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: actorhub-secrets
+                  key: redis-url
+            - name: CELERY_RESULT_BACKEND
+              valueFrom:
+                secretKeyRef:
+                  name: actorhub-secrets
+                  key: redis-url
+            - name: REPLICATE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: actorhub-secrets
+                  key: replicate-api-token
+            - name: ELEVENLABS_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: actorhub-secrets
+                  key: elevenlabs-api-key
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: actorhub-secrets
+                  key: aws-access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: actorhub-secrets
+                  key: aws-secret-access-key
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "500m"
+            limits:
+              memory: "4Gi"
+              cpu: "2000m"
+      imagePullSecrets:
+        - name: ghcr-secret
+---
+# Celery Beat Scheduler (single instance)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: actorhub-beat
+  namespace: actorhub
+  labels:
+    app: actorhub-beat
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: actorhub-beat
+  template:
+    metadata:
+      labels:
+        app: actorhub-beat
+    spec:
+      containers:
+        - name: beat
+          image: ghcr.io/actorhub/worker:latest
+          command: ["celery", "-A", "celery_app", "beat", "-l", "info"]
+          env:
+            - name: CELERY_BROKER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: actorhub-secrets
+                  key: redis-url
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "100m"
+      imagePullSecrets:
+        - name: ghcr-secret

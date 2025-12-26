@@ -4,68 +4,29 @@ Billing and subscription management
 """
 
 from datetime import datetime
-from typing import Optional
-from uuid import UUID
+from typing import List, Optional
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.helpers import utc_now  # MEDIUM FIX: Use timezone-aware datetime
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.notifications import Subscription, SubscriptionPlan, SubscriptionStatus
 from app.models.user import User, UserTier
+from app.schemas.subscription import (
+    CheckoutResponse,
+    CreateCheckoutRequest,
+    PlanInfo,
+    SubscriptionResponse,
+)
+from app.services.user import UserService
 
 logger = structlog.get_logger()
 router = APIRouter()
-
-
-class SubscriptionResponse(BaseModel):
-    """Subscription details"""
-    id: UUID
-    plan: str
-    status: str
-    amount: float
-    currency: str
-    interval: Optional[str]
-    current_period_start: Optional[datetime]
-    current_period_end: Optional[datetime]
-    cancel_at_period_end: bool
-    identities_limit: int
-    api_calls_limit: int
-    storage_limit_mb: int
-
-    class Config:
-        from_attributes = True
-
-
-class PlanInfo(BaseModel):
-    """Plan information"""
-    id: str
-    name: str
-    price_monthly: float
-    price_yearly: float
-    identities_limit: int
-    api_calls_limit: int
-    storage_limit_mb: int
-    features: list
-
-
-class CreateCheckoutRequest(BaseModel):
-    """Request to create checkout session"""
-    plan: SubscriptionPlan
-    interval: str = "month"  # "month" or "year"
-    success_url: Optional[str] = None
-    cancel_url: Optional[str] = None
-
-
-class CheckoutResponse(BaseModel):
-    """Checkout session response"""
-    checkout_url: str
-    session_id: str
 
 
 # Plan configurations
@@ -113,12 +74,20 @@ PLANS = {
 }
 
 
-@router.get("/current", response_model=Optional[SubscriptionResponse])
+@router.get("/current", response_model=SubscriptionResponse)
 async def get_current_subscription(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get user's current subscription"""
+    """
+    Get user's current subscription.
+
+    **Returns:** Current active subscription details.
+
+    **Errors:**
+    - 401: Unauthorized
+    - 404: No active subscription found
+    """
     query = select(Subscription).where(
         Subscription.user_id == current_user.id,
         Subscription.status.in_([
@@ -132,7 +101,7 @@ async def get_current_subscription(
     subscription = result.scalar_one_or_none()
 
     if not subscription:
-        return None
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active subscription found")
 
     return SubscriptionResponse(
         id=subscription.id,
@@ -152,7 +121,16 @@ async def get_current_subscription(
 
 @router.get("/plans")
 async def get_available_plans():
-    """Get all available subscription plans"""
+    """
+    Get all available subscription plans.
+
+    **Returns:** List of available plans with pricing and features.
+
+    Plans include:
+    - **Free**: 3 identities, 100 API calls/month
+    - **Pro**: 25 identities, 10,000 API calls/month
+    - **Enterprise**: Unlimited identities, 100,000 API calls/month
+    """
     plans = []
     for plan_id, plan_info in PLANS.items():
         plans.append(
@@ -170,13 +148,22 @@ async def get_available_plans():
     return {"plans": plans}
 
 
-@router.post("/checkout", response_model=CheckoutResponse)
+@router.post("/checkout", response_model=CheckoutResponse, status_code=status.HTTP_201_CREATED)
 async def create_checkout_session(
     request: CreateCheckoutRequest,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Create a Stripe checkout session for subscription"""
+    """
+    Create a Stripe checkout session for subscription.
+
+    **Returns:** 201 Created with checkout URL and session ID.
+
+    **Errors:**
+    - 400: Invalid plan or cannot checkout free plan
+    - 401: Unauthorized
+    - 503: Payment system not configured
+    """
     import stripe
 
     stripe.api_key = settings.STRIPE_SECRET_KEY
@@ -184,8 +171,16 @@ async def create_checkout_session(
     if not stripe.api_key:
         raise HTTPException(status_code=503, detail="Payment system not configured")
 
+    # Convert string plan to SubscriptionPlan enum
+    plan_key = None
+    plan_value = request.plan.upper() if isinstance(request.plan, str) else request.plan.value.upper()
+    for plan_enum in SubscriptionPlan:
+        if plan_enum.value.upper() == plan_value or plan_enum.name == plan_value:
+            plan_key = plan_enum
+            break
+
     # Get plan details
-    plan_info = PLANS.get(request.plan)
+    plan_info = PLANS.get(plan_key) if plan_key else None
     if not plan_info:
         raise HTTPException(status_code=400, detail="Invalid plan")
 
@@ -199,24 +194,16 @@ async def create_checkout_session(
         raise HTTPException(status_code=400, detail="Cannot checkout free plan")
 
     try:
-        # Create or get Stripe customer
-        if not current_user.stripe_customer_id:
-            customer = stripe.Customer.create(
-                email=current_user.email,
-                name=current_user.full_name,
-                metadata={"user_id": str(current_user.id)},
-            )
-            current_user.stripe_customer_id = customer.id
-            await db.commit()
-        else:
-            customer = stripe.Customer.retrieve(current_user.stripe_customer_id)
+        # Ensure user has Stripe customer ID
+        user_service = UserService(db)
+        customer_id = await user_service.ensure_stripe_customer(current_user)
 
         # Create checkout session
         success_url = request.success_url or f"{settings.FRONTEND_URL}/billing/success"
         cancel_url = request.cancel_url or f"{settings.FRONTEND_URL}/billing/cancel"
 
         session = stripe.checkout.Session.create(
-            customer=customer.id,
+            customer=customer_id,
             payment_method_types=["card"],
             mode="subscription",
             line_items=[
@@ -237,7 +224,7 @@ async def create_checkout_session(
             cancel_url=cancel_url,
             metadata={
                 "user_id": str(current_user.id),
-                "plan": request.plan.value,
+                "plan": plan_key.value if plan_key else request.plan,
                 "interval": request.interval,
             },
         )
@@ -248,8 +235,9 @@ async def create_checkout_session(
         )
 
     except stripe.StripeError as e:
-        logger.error(f"Stripe error: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        # SECURITY FIX: Log error details but don't expose to client
+        logger.error(f"Stripe checkout error: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail="Payment processing error. Please try again.")
 
 
 @router.post("/cancel")
@@ -257,7 +245,16 @@ async def cancel_subscription(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Cancel subscription at period end"""
+    """
+    Cancel subscription at period end.
+
+    **Returns:** Success status and period end date.
+
+    **Errors:**
+    - 400: Stripe error
+    - 401: Unauthorized
+    - 404: No active subscription found
+    """
     import stripe
 
     stripe.api_key = settings.STRIPE_SECRET_KEY
@@ -291,8 +288,9 @@ async def cancel_subscription(
         }
 
     except stripe.StripeError as e:
-        logger.error(f"Stripe error canceling subscription: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        # SECURITY FIX: Log error details but don't expose to client
+        logger.error(f"Stripe error canceling subscription: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail="Failed to cancel subscription. Please try again.")
 
 
 @router.post("/reactivate")
@@ -300,7 +298,19 @@ async def reactivate_subscription(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Reactivate a canceled subscription"""
+    """
+    Reactivate a canceled subscription.
+
+    Only works for subscriptions that are scheduled for cancellation
+    but haven't expired yet.
+
+    **Returns:** Success status message.
+
+    **Errors:**
+    - 400: Stripe error
+    - 401: Unauthorized
+    - 404: No canceled subscription found
+    """
     import stripe
 
     stripe.api_key = settings.STRIPE_SECRET_KEY
@@ -333,8 +343,9 @@ async def reactivate_subscription(
         }
 
     except stripe.StripeError as e:
-        logger.error(f"Stripe error reactivating subscription: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        # SECURITY FIX: Log error details but don't expose to client
+        logger.error(f"Stripe error reactivating subscription: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail="Failed to reactivate subscription. Please try again.")
 
 
 @router.get("/usage")
@@ -342,7 +353,18 @@ async def get_usage(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get current billing period usage"""
+    """
+    Get current billing period usage.
+
+    **Returns:** Current usage metrics vs. plan limits:
+    - Identities count
+    - API calls this period
+    - Storage used (MB)
+    - Period start/end dates
+
+    **Errors:**
+    - 401: Unauthorized
+    """
     from sqlalchemy import func
     from app.models.identity import Identity, UsageLog
 
@@ -388,7 +410,7 @@ async def get_usage(
     else:
         # For free tier, count from start of month
         from datetime import datetime
-        now = datetime.utcnow()
+        now = utc_now()
         month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         api_calls = await db.scalar(
             select(func.count()).where(

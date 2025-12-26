@@ -56,7 +56,155 @@ ACTIVE_USERS = Gauge("active_users", "Number of active users")
 
 ACTIVE_TRAININGS = Gauge("active_trainings", "Number of active Actor Pack trainings")
 
+# Database connection pool metrics
 DB_POOL_SIZE = Gauge("db_connection_pool_size", "Database connection pool size")
+DB_POOL_CHECKED_OUT = Gauge("db_pool_checked_out", "Number of connections currently in use")
+DB_POOL_OVERFLOW = Gauge("db_pool_overflow", "Number of overflow connections in use")
+DB_POOL_AVAILABLE = Gauge("db_pool_available", "Number of available connections in pool")
+DB_POOL_WAIT_SECONDS = Histogram(
+    "db_pool_wait_seconds",
+    "Time spent waiting for a connection from pool",
+    buckets=[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0]
+)
+DB_POOL_EXHAUSTED = Counter(
+    "db_pool_exhausted_total",
+    "Number of times pool was exhausted (no connections available)"
+)
+
+# HIGH FIX: Authentication failure metrics
+AUTH_FAILURES = Counter(
+    "auth_failures_total",
+    "Total authentication failures",
+    ["type", "reason"]  # type: jwt, api_key, 2fa; reason: invalid, expired, user_not_found
+)
+
+AUTH_SUCCESS = Counter(
+    "auth_success_total",
+    "Total successful authentications",
+    ["type"]  # type: jwt, api_key, 2fa
+)
+
+API_KEY_VALIDATIONS = Counter(
+    "api_key_validations_total",
+    "Total API key validations",
+    ["status"]  # status: valid, invalid, expired, not_found
+)
+
+# Rate limiting metrics
+RATE_LIMIT_EXCEEDED = Counter(
+    "rate_limit_exceeded_total",
+    "Total rate limit exceeded events",
+    ["endpoint", "tier", "identifier_type"]
+)
+
+RATE_LIMIT_REQUESTS = Counter(
+    "rate_limit_requests_total",
+    "Total requests processed by rate limiter",
+    ["endpoint", "tier", "allowed"]
+)
+
+# Notification delivery metrics
+NOTIFICATION_SENT = Counter(
+    "notification_sent_total",
+    "Total notifications sent",
+    ["type", "status"]  # type: email, push, webhook; status: success, failed
+)
+
+EMAIL_SENT = Counter(
+    "email_sent_total",
+    "Total emails sent",
+    ["template", "status"]
+)
+
+WEBHOOK_DELIVERY = Counter(
+    "webhook_delivery_total",
+    "Total webhook deliveries",
+    ["endpoint", "status"]
+)
+
+WEBHOOK_LATENCY = Histogram(
+    "webhook_latency_seconds",
+    "Webhook delivery latency",
+    ["endpoint"],
+    buckets=[0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0]
+)
+
+# ===========================================
+# Resilience Metrics
+# ===========================================
+
+# Circuit breaker metrics
+CIRCUIT_BREAKER_STATE = Gauge(
+    "circuit_breaker_state",
+    "Circuit breaker state (0=closed, 1=open, 2=half_open)",
+    ["service"],
+)
+
+CIRCUIT_BREAKER_FAILURES = Counter(
+    "circuit_breaker_failures_total",
+    "Total circuit breaker failures",
+    ["service"],
+)
+
+CIRCUIT_BREAKER_SUCCESSES = Counter(
+    "circuit_breaker_successes_total",
+    "Total circuit breaker successes",
+    ["service"],
+)
+
+CIRCUIT_BREAKER_REJECTIONS = Counter(
+    "circuit_breaker_rejections_total",
+    "Total requests rejected by open circuit breaker",
+    ["service"],
+)
+
+# Retry metrics
+RETRY_ATTEMPTS = Counter(
+    "retry_attempts_total",
+    "Total retry attempts",
+    ["service", "operation"],
+)
+
+RETRY_SUCCESSES = Counter(
+    "retry_successes_total",
+    "Total successful retries (after initial failure)",
+    ["service", "operation"],
+)
+
+RETRY_EXHAUSTED = Counter(
+    "retry_exhausted_total",
+    "Total operations that exhausted all retries",
+    ["service", "operation"],
+)
+
+# Timeout metrics
+OPERATION_TIMEOUTS = Counter(
+    "operation_timeouts_total",
+    "Total operation timeouts",
+    ["service", "operation"],
+)
+
+# External service call metrics
+EXTERNAL_SERVICE_LATENCY = Histogram(
+    "external_service_latency_seconds",
+    "External service call latency",
+    ["service", "operation"],
+    buckets=[0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0],
+)
+
+# CRITICAL FIX: Add missing metric used by payments.py
+EXTERNAL_CALL_DURATION = Histogram(
+    "external_call_duration_seconds",
+    "Duration of external API calls (Stripe, etc.)",
+    ["service", "operation", "status"],
+    buckets=[0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0],
+)
+
+EXTERNAL_SERVICE_CALLS = Counter(
+    "external_service_calls_total",
+    "Total external service calls",
+    ["service", "operation", "status"],
+)
 
 
 # ===========================================
@@ -116,8 +264,71 @@ def filter_sensitive_data(event, hint):
 # ===========================================
 
 
+def update_pool_metrics():
+    """
+    Update database connection pool metrics.
+
+    Call this periodically or on each request to track pool health.
+    Alerts when pool usage exceeds 80% threshold.
+    """
+    try:
+        from app.core.database import engine
+
+        pool = engine.pool
+        pool_status = pool.status()
+
+        # Parse pool status: "Pool size: X  Connections in pool: Y checked out: Z"
+        # SQLAlchemy pool object provides these directly
+        pool_size = pool.size()
+        checked_out = pool.checkedout()
+        overflow = pool.overflow()
+        available = pool_size - checked_out + pool.checkedin()
+
+        # Update Prometheus metrics
+        DB_POOL_SIZE.set(pool_size)
+        DB_POOL_CHECKED_OUT.set(checked_out)
+        DB_POOL_OVERFLOW.set(overflow)
+        DB_POOL_AVAILABLE.set(max(0, available))
+
+        # Calculate utilization percentage
+        max_connections = pool_size + pool._max_overflow
+        utilization = checked_out / max_connections if max_connections > 0 else 0
+
+        # Log warning if pool is getting exhausted (>80% utilization)
+        if utilization > 0.8:
+            logger.warning(
+                "Database connection pool nearing exhaustion",
+                pool_size=pool_size,
+                checked_out=checked_out,
+                overflow=overflow,
+                utilization=f"{utilization:.1%}",
+                max_connections=max_connections,
+            )
+
+        # Track exhaustion events
+        if checked_out >= max_connections:
+            DB_POOL_EXHAUSTED.inc()
+            logger.error(
+                "Database connection pool EXHAUSTED",
+                pool_size=pool_size,
+                checked_out=checked_out,
+                overflow=overflow,
+            )
+
+        return {
+            "pool_size": pool_size,
+            "checked_out": checked_out,
+            "overflow": overflow,
+            "available": available,
+            "utilization": utilization,
+        }
+    except Exception as e:
+        logger.error("Failed to update pool metrics", error=str(e))
+        return None
+
+
 async def check_database_health() -> dict:
-    """Check database connectivity"""
+    """Check database connectivity and pool health"""
     from sqlalchemy import text
 
     from app.core.database import async_session_maker
@@ -128,7 +339,17 @@ async def check_database_health() -> dict:
             await session.execute(text("SELECT 1"))
         latency = time.time() - start
 
-        return {"status": "healthy", "latency_ms": round(latency * 1000, 2)}
+        # Also update pool metrics
+        pool_stats = update_pool_metrics()
+
+        result = {"status": "healthy", "latency_ms": round(latency * 1000, 2)}
+        if pool_stats:
+            result["pool"] = pool_stats
+            # Mark as degraded if pool utilization is high
+            if pool_stats["utilization"] > 0.8:
+                result["status"] = "degraded"
+                result["warning"] = "Connection pool nearing exhaustion"
+        return result
     except Exception as e:
         return {"status": "unhealthy", "error": str(e)}
 
@@ -266,6 +487,42 @@ async def check_sendgrid_health() -> dict:
         }
     except Exception as e:
         return {"status": "unhealthy", "error": str(e)}
+
+
+async def get_circuit_breaker_status() -> dict:
+    """Get status of all circuit breakers for resilience observability"""
+    from app.core.resilience import CircuitState
+
+    # Registry of known circuit breakers - will be populated as they're used
+    circuit_breakers = {}
+
+    try:
+        # Import services that have circuit breakers
+        from app.services.training import _replicate_circuit, _elevenlabs_circuit
+
+        circuit_breakers["replicate"] = _replicate_circuit
+        circuit_breakers["elevenlabs"] = _elevenlabs_circuit
+    except ImportError:
+        pass
+
+    try:
+        from app.services.payments import StripeService
+
+        if hasattr(StripeService, "_circuit_breaker"):
+            circuit_breakers["stripe"] = StripeService._circuit_breaker
+    except ImportError:
+        pass
+
+    status = {}
+    for name, cb in circuit_breakers.items():
+        state_name = cb.state.name if hasattr(cb, "state") else "unknown"
+        status[name] = {
+            "state": state_name,
+            "is_open": cb.is_open if hasattr(cb, "is_open") else False,
+            "failure_count": cb._failure_count if hasattr(cb, "_failure_count") else 0,
+        }
+
+    return status
 
 
 async def get_health_status(include_external: bool = False) -> dict:
@@ -413,3 +670,9 @@ class MetricsMiddleware:
             REQUEST_COUNT.labels(method=method, endpoint=path, status=status_code).inc()
 
             REQUEST_LATENCY.labels(method=method, endpoint=path).observe(duration)
+
+            # Update pool metrics periodically (every ~100 requests to avoid overhead)
+            # Using a simple sampling approach
+            import random
+            if random.random() < 0.01:  # ~1% of requests
+                update_pool_metrics()

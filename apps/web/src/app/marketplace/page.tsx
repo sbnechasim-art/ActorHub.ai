@@ -9,10 +9,11 @@ import {
 } from 'lucide-react'
 import Link from 'next/link'
 import { Button } from '@/components/ui/button'
+import { Logo } from '@/components/ui/logo'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { marketplaceApi } from '@/lib/api'
-import { formatCurrency, cn } from '@/lib/utils'
+import { formatCurrency, cn, getProxiedImageUrl } from '@/lib/utils'
 
 const CATEGORIES = [
   { id: 'all', name: 'All', icon: Sparkles },
@@ -196,13 +197,14 @@ const SAMPLE_ACTORS = USE_MOCK_DATA ? [
 
 function FeaturedCard({ listing }: { listing: any }) {
   const minPrice = listing.pricing_tiers?.[0]?.price || 0
+  const imageUrl = getProxiedImageUrl(listing.thumbnail_url)
 
   return (
     <Card className="bg-gradient-to-br from-slate-800/80 to-slate-900/80 border-slate-700/50 overflow-hidden group hover:border-purple-500/50 transition-all duration-300 hover:shadow-xl hover:shadow-purple-500/10">
       <div className="relative">
         <div className="aspect-[4/5] relative overflow-hidden">
           <img
-            src={listing.thumbnail_url}
+            src={imageUrl}
             alt={listing.title}
             className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
           />
@@ -256,13 +258,14 @@ function FeaturedCard({ listing }: { listing: any }) {
 function ListingCard({ listing }: { listing: any }) {
   const minPrice = listing.pricing_tiers?.[0]?.price || 0
   const [isLiked, setIsLiked] = useState(false)
+  const imageUrl = getProxiedImageUrl(listing.thumbnail_url)
 
   return (
     <Card className="bg-slate-800/50 border-slate-700/50 overflow-hidden group hover:border-slate-600 hover:shadow-lg transition-all duration-300">
       <div className="aspect-square relative overflow-hidden">
-        {listing.thumbnail_url ? (
+        {imageUrl ? (
           <img
-            src={listing.thumbnail_url}
+            src={imageUrl}
             alt={listing.title}
             className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
           />
@@ -346,15 +349,27 @@ export default function MarketplacePage() {
   const [searchQuery, setSearchQuery] = useState('')
   const [selectedCategory, setSelectedCategory] = useState('all')
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid')
+  const [sortBy, setSortBy] = useState('newest') // Default to newest so new listings appear first
+
+  // Debug: Log component mount
+  console.log('[MarketplacePage] Rendering, category:', selectedCategory, 'sortBy:', sortBy)
 
   // Fetch all listings from API
-  const { data: apiListings, isLoading } = useQuery({
-    queryKey: ['listings', selectedCategory, searchQuery],
-    queryFn: () => marketplaceApi.getListings({
-      category: selectedCategory !== 'all' ? selectedCategory : undefined,
-      query: searchQuery || undefined,
-    }),
+  const { data: apiListings, isLoading, error, isFetching } = useQuery({
+    queryKey: ['listings', selectedCategory, searchQuery, sortBy],
+    queryFn: () => {
+      console.log('[MarketplacePage] queryFn called - making API request')
+      return marketplaceApi.getListings({
+        category: selectedCategory !== 'all' ? selectedCategory : undefined,
+        query: searchQuery || undefined,
+        sort_by: sortBy,
+        limit: 100, // Show more listings
+      })
+    },
   })
+
+  // Debug: Log query state
+  console.log('[MarketplacePage] Query state:', { isLoading, isFetching, error, dataLength: apiListings?.length })
 
   // Fetch featured listings from API
   const { data: featuredListings } = useQuery({
@@ -366,10 +381,10 @@ export default function MarketplacePage() {
   const allListings = apiListings?.length ? apiListings : (USE_MOCK_DATA ? SAMPLE_ACTORS : [])
   const featuredActors = featuredListings?.length ? featuredListings : (USE_MOCK_DATA ? FEATURED_ACTORS : [])
 
-  // Filter by category
+  // Filter by category (case-insensitive comparison)
   const filteredListings = selectedCategory === 'all'
     ? allListings
-    : allListings.filter(l => l.category === selectedCategory)
+    : allListings.filter(l => l.category?.toLowerCase() === selectedCategory.toLowerCase())
 
   // Filter by search query
   const searchedListings = searchQuery
@@ -384,12 +399,7 @@ export default function MarketplacePage() {
       {/* Header */}
       <header className="border-b border-slate-800/50 bg-slate-950/80 backdrop-blur-xl sticky top-0 z-40">
         <div className="container mx-auto px-4 h-16 flex items-center justify-between">
-          <Link href="/" className="flex items-center gap-2">
-            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center">
-              <Shield className="w-5 h-5 text-white" />
-            </div>
-            <span className="text-xl font-bold text-white">ActorHub.ai</span>
-          </Link>
+          <Logo variant="full" size="md" href="/" />
           <div className="flex items-center gap-4">
             <Link href="/dashboard">
               <Button variant="ghost" className="text-slate-400 hover:text-white">Dashboard</Button>
@@ -534,12 +544,16 @@ export default function MarketplacePage() {
               <p className="text-slate-400">
                 Showing <span className="text-white font-medium">{searchedListings.length}</span> results
               </p>
-              <select className="bg-slate-800/50 border border-slate-700/50 rounded-lg px-3 py-2 text-sm text-slate-300">
-                <option>Most Popular</option>
-                <option>Newest</option>
-                <option>Price: Low to High</option>
-                <option>Price: High to Low</option>
-                <option>Highest Rated</option>
+              <select
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value)}
+                className="bg-slate-800/50 border border-slate-700/50 rounded-lg px-3 py-2 text-sm text-slate-300"
+              >
+                <option value="popular">Most Popular</option>
+                <option value="newest">Newest</option>
+                <option value="price_low">Price: Low to High</option>
+                <option value="price_high">Price: High to Low</option>
+                <option value="rating">Highest Rated</option>
               </select>
             </div>
 

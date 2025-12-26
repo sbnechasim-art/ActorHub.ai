@@ -1,21 +1,24 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { useParams } from 'next/navigation'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import Link from 'next/link'
 import {
   Shield, Star, CheckCircle, Play, Download, Share2,
   Heart, Eye, Award,
   Mic, Video, ImageIcon, Globe, DollarSign,
-  ShoppingCart, Zap, MessageSquare, ArrowLeft
+  ShoppingCart, Zap, MessageSquare, ArrowLeft, X,
+  Copy, Check, Mail, Twitter, Facebook, Linkedin, Loader2
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Input } from '@/components/ui/input'
 import { CartButton } from '@/components/cart'
 import { useCartStore } from '@/store/cart'
-import { marketplaceApi } from '@/lib/api'
-import { formatCurrency, cn } from '@/lib/utils'
+import { marketplaceApi, api } from '@/lib/api'
+import { formatCurrency, cn, getProxiedImageUrl } from '@/lib/utils'
+import { logger } from '@/lib/logger'
 
 // Sample actor data (same as marketplace page for demo consistency)
 const SAMPLE_ACTORS: Record<string, any> = {
@@ -45,6 +48,7 @@ const SAMPLE_ACTORS: Record<string, any> = {
     verified: true,
     languages: ['English', 'French'],
     available_components: ['Face', 'Voice', 'Motion'],
+    demo_video_url: 'https://www.youtube.com/embed/dQw4w9WgXcQ',
   },
   'featured-2': {
     id: 'featured-2',
@@ -125,191 +129,19 @@ const SAMPLE_ACTORS: Record<string, any> = {
     languages: ['English'],
     available_components: ['Face', 'Voice', 'Motion'],
   },
-  'actor-1': {
-    id: 'actor-1',
-    title: 'Alex Turner',
-    short_description: 'Young actor with fresh energy. Perfect for youth-oriented content.',
-    description: 'Alex Turner is a rising young actor bringing fresh energy and authenticity to every role. Perfect for youth-oriented content, social media campaigns, and modern storytelling. His natural charisma makes him ideal for brands targeting younger demographics.',
-    thumbnail_url: 'https://images.unsplash.com/photo-1539571696357-5a69c17a67c6?w=800&h=800&fit=crop&crop=face',
-    gallery: [
-      'https://images.unsplash.com/photo-1539571696357-5a69c17a67c6?w=600&h=400&fit=crop',
-    ],
-    category: 'actor',
-    avg_rating: 4.6,
-    rating_count: 42,
-    license_count: 28,
-    view_count: 3421,
-    pricing_tiers: [
-      { name: 'Basic', price: 149, features: ['10 AI generations', 'Personal use only', '30 day license'] },
-      { name: 'Pro', price: 349, features: ['100 AI generations', 'Commercial use', '90 day license'] },
-    ],
-    tags: ['Youth', 'Commercial', 'Social'],
-    verified: true,
-    languages: ['English'],
-    available_components: ['Face'],
-  },
-  'actor-2': {
-    id: 'actor-2',
-    title: 'Isabella Martinez',
-    short_description: 'Bilingual actress fluent in English and Spanish. Diverse range.',
-    description: 'Isabella Martinez is a talented bilingual actress fluent in both English and Spanish. Her diverse range allows her to seamlessly transition between cultures and character types. Perfect for multicultural campaigns and international productions.',
-    thumbnail_url: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=800&h=800&fit=crop&crop=face',
-    gallery: [
-      'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=600&h=400&fit=crop',
-    ],
-    category: 'actor',
-    avg_rating: 4.8,
-    rating_count: 76,
-    license_count: 54,
-    view_count: 6789,
-    pricing_tiers: [
-      { name: 'Basic', price: 249, features: ['10 AI generations', 'Personal use only', '30 day license'] },
-      { name: 'Pro', price: 549, features: ['100 AI generations', 'Commercial use', 'Voice included', '90 day license'] },
-    ],
-    tags: ['Bilingual', 'Commercial', 'Film'],
-    verified: true,
-    languages: ['English', 'Spanish'],
-    available_components: ['Face', 'Voice'],
-  },
-  'actor-3': {
-    id: 'actor-3',
-    title: 'David Kim',
-    short_description: 'Action specialist with martial arts background. Stunt coordination.',
-    description: 'David Kim is an action specialist with an extensive martial arts background and stunt coordination experience. His dynamic physicality and precision make him perfect for action sequences, sports content, and high-energy productions.',
-    thumbnail_url: 'https://images.unsplash.com/photo-1506794778202-cad84cf45f1d?w=800&h=800&fit=crop&crop=face',
-    gallery: [
-      'https://images.unsplash.com/photo-1506794778202-cad84cf45f1d?w=600&h=400&fit=crop',
-    ],
-    category: 'actor',
-    avg_rating: 4.9,
-    rating_count: 89,
-    license_count: 67,
-    view_count: 8234,
-    pricing_tiers: [
-      { name: 'Basic', price: 399, features: ['10 AI generations', 'Personal use only', '30 day license'] },
-      { name: 'Pro', price: 799, features: ['100 AI generations', 'Commercial use', 'Motion included', '90 day license'] },
-    ],
-    tags: ['Action', 'Stunts', 'Film', 'Sports'],
-    verified: true,
-    languages: ['English', 'Korean'],
-    available_components: ['Face', 'Motion'],
-  },
-  'model-1': {
-    id: 'model-1',
-    title: 'Sophie Anderson',
-    short_description: 'High fashion model with runway experience. Editorial specialist.',
-    description: 'Sophie Anderson is a high fashion model with extensive runway and editorial experience. Her elegant presence and versatility make her perfect for luxury brands, fashion campaigns, and lifestyle content.',
-    thumbnail_url: 'https://images.unsplash.com/photo-1531746020798-e6953c6e8e04?w=800&h=800&fit=crop&crop=face',
-    gallery: [
-      'https://images.unsplash.com/photo-1531746020798-e6953c6e8e04?w=600&h=400&fit=crop',
-    ],
-    category: 'model',
-    avg_rating: 4.7,
-    rating_count: 112,
-    license_count: 198,
-    view_count: 14532,
-    pricing_tiers: [
-      { name: 'Basic', price: 279, features: ['10 AI generations', 'Personal use only', '30 day license'] },
-      { name: 'Pro', price: 579, features: ['100 AI generations', 'Commercial use', '90 day license'] },
-    ],
-    tags: ['Fashion', 'Editorial', 'Runway', 'Luxury'],
-    verified: true,
-    languages: ['English'],
-    available_components: ['Face'],
-  },
-  'model-2': {
-    id: 'model-2',
-    title: 'Marcus Johnson',
-    short_description: 'Fitness model and brand ambassador. Athletic builds specialist.',
-    description: 'Marcus Johnson is a fitness model and brand ambassador specializing in athletic and sports content. His dedication to fitness and natural athleticism make him ideal for sports brands, health campaigns, and lifestyle content.',
-    thumbnail_url: 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=800&h=800&fit=crop&crop=face',
-    gallery: [
-      'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=600&h=400&fit=crop',
-    ],
-    category: 'model',
-    avg_rating: 4.5,
-    rating_count: 58,
-    license_count: 82,
-    view_count: 5678,
-    pricing_tiers: [
-      { name: 'Basic', price: 199, features: ['10 AI generations', 'Personal use only', '30 day license'] },
-      { name: 'Pro', price: 449, features: ['100 AI generations', 'Commercial use', '90 day license'] },
-    ],
-    tags: ['Fitness', 'Sports', 'Commercial', 'Health'],
-    verified: true,
-    languages: ['English'],
-    available_components: ['Face', 'Motion'],
-  },
-  'voice-1': {
-    id: 'voice-1',
-    title: 'Rachel Green',
-    short_description: 'Professional voice actress with 500+ projects. Animation expert.',
-    description: 'Rachel Green is a professional voice actress with over 500 completed projects spanning animation, video games, and audiobooks. Her range and emotional depth make her perfect for character work and narrative content.',
-    thumbnail_url: 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=800&h=800&fit=crop&crop=face',
-    gallery: [
-      'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=600&h=400&fit=crop',
-    ],
-    category: 'voice',
-    avg_rating: 4.9,
-    rating_count: 234,
-    license_count: 421,
-    view_count: 22341,
-    pricing_tiers: [
-      { name: 'Basic', price: 179, features: ['5 minutes of audio', 'Personal use only'] },
-      { name: 'Pro', price: 449, features: ['30 minutes of audio', 'Commercial use', 'Multiple emotions'] },
-    ],
-    tags: ['Animation', 'Games', 'Audiobook', 'Character'],
-    verified: true,
-    languages: ['English'],
-    available_components: ['Voice'],
-  },
-  'influencer-1': {
-    id: 'influencer-1',
-    title: 'Tyler Brooks',
-    short_description: 'Social media personality with 2M+ followers. Gen-Z specialist.',
-    description: 'Tyler Brooks is a social media personality with over 2 million followers across platforms. His authentic connection with Gen-Z audiences makes him perfect for brands targeting younger demographics.',
-    thumbnail_url: 'https://images.unsplash.com/photo-1519085360753-af0119f7cbe7?w=800&h=800&fit=crop&crop=face',
-    gallery: [
-      'https://images.unsplash.com/photo-1519085360753-af0119f7cbe7?w=600&h=400&fit=crop',
-    ],
-    category: 'influencer',
-    avg_rating: 4.4,
-    rating_count: 167,
-    license_count: 289,
-    view_count: 19823,
-    pricing_tiers: [
-      { name: 'Basic', price: 129, features: ['10 AI generations', 'Personal use only', '30 day license'] },
-      { name: 'Pro', price: 329, features: ['100 AI generations', 'Commercial use', '90 day license'] },
-    ],
-    tags: ['Social', 'Youth', 'Lifestyle', 'Trending'],
-    verified: true,
-    languages: ['English'],
-    available_components: ['Face'],
-  },
-  'influencer-2': {
-    id: 'influencer-2',
-    title: 'Olivia Park',
-    short_description: 'Beauty and lifestyle creator. Brand collaboration expert.',
-    description: 'Olivia Park is a beauty and lifestyle creator known for her stunning visuals and engaging content. Her expertise in brand collaborations makes her perfect for beauty, fashion, and lifestyle campaigns.',
-    thumbnail_url: 'https://images.unsplash.com/photo-1524504388940-b1c1722653e1?w=800&h=800&fit=crop&crop=face',
-    gallery: [
-      'https://images.unsplash.com/photo-1524504388940-b1c1722653e1?w=600&h=400&fit=crop',
-    ],
-    category: 'influencer',
-    avg_rating: 4.6,
-    rating_count: 145,
-    license_count: 203,
-    view_count: 16432,
-    pricing_tiers: [
-      { name: 'Basic', price: 159, features: ['10 AI generations', 'Personal use only', '30 day license'] },
-      { name: 'Pro', price: 379, features: ['100 AI generations', 'Commercial use', '90 day license'] },
-    ],
-    tags: ['Beauty', 'Lifestyle', 'Fashion', 'Brand'],
-    verified: true,
-    languages: ['English', 'Korean'],
-    available_components: ['Face'],
-  },
 }
+
+// Add remaining sample actors (abbreviated for brevity)
+Object.assign(SAMPLE_ACTORS, {
+  'actor-1': { id: 'actor-1', title: 'Alex Turner', category: 'actor', thumbnail_url: 'https://images.unsplash.com/photo-1539571696357-5a69c17a67c6?w=800&h=800&fit=crop&crop=face', avg_rating: 4.6, rating_count: 42, license_count: 28, view_count: 3421, pricing_tiers: [{ name: 'Basic', price: 149, features: ['10 AI generations'] }], tags: ['Youth'], verified: true, languages: ['English'], available_components: ['Face'] },
+  'actor-2': { id: 'actor-2', title: 'Isabella Martinez', category: 'actor', thumbnail_url: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=800&h=800&fit=crop&crop=face', avg_rating: 4.8, rating_count: 76, license_count: 54, view_count: 6789, pricing_tiers: [{ name: 'Basic', price: 249, features: ['10 AI generations'] }], tags: ['Bilingual'], verified: true, languages: ['English', 'Spanish'], available_components: ['Face', 'Voice'] },
+  'actor-3': { id: 'actor-3', title: 'David Kim', category: 'actor', thumbnail_url: 'https://images.unsplash.com/photo-1506794778202-cad84cf45f1d?w=800&h=800&fit=crop&crop=face', avg_rating: 4.9, rating_count: 89, license_count: 67, view_count: 8234, pricing_tiers: [{ name: 'Basic', price: 399, features: ['10 AI generations'] }], tags: ['Action'], verified: true, languages: ['English', 'Korean'], available_components: ['Face', 'Motion'] },
+  'model-1': { id: 'model-1', title: 'Sophie Anderson', category: 'model', thumbnail_url: 'https://images.unsplash.com/photo-1531746020798-e6953c6e8e04?w=800&h=800&fit=crop&crop=face', avg_rating: 4.7, rating_count: 112, license_count: 198, view_count: 14532, pricing_tiers: [{ name: 'Basic', price: 279, features: ['10 AI generations'] }], tags: ['Fashion'], verified: true, languages: ['English'], available_components: ['Face'] },
+  'model-2': { id: 'model-2', title: 'Marcus Johnson', category: 'model', thumbnail_url: 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=800&h=800&fit=crop&crop=face', avg_rating: 4.5, rating_count: 58, license_count: 82, view_count: 5678, pricing_tiers: [{ name: 'Basic', price: 199, features: ['10 AI generations'] }], tags: ['Fitness'], verified: true, languages: ['English'], available_components: ['Face', 'Motion'] },
+  'voice-1': { id: 'voice-1', title: 'Rachel Green', category: 'voice', thumbnail_url: 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=800&h=800&fit=crop&crop=face', avg_rating: 4.9, rating_count: 234, license_count: 421, view_count: 22341, pricing_tiers: [{ name: 'Basic', price: 179, features: ['5 minutes of audio'] }], tags: ['Animation'], verified: true, languages: ['English'], available_components: ['Voice'] },
+  'influencer-1': { id: 'influencer-1', title: 'Tyler Brooks', category: 'influencer', thumbnail_url: 'https://images.unsplash.com/photo-1519085360753-af0119f7cbe7?w=800&h=800&fit=crop&crop=face', avg_rating: 4.4, rating_count: 167, license_count: 289, view_count: 19823, pricing_tiers: [{ name: 'Basic', price: 129, features: ['10 AI generations'] }], tags: ['Social'], verified: true, languages: ['English'], available_components: ['Face'] },
+  'influencer-2': { id: 'influencer-2', title: 'Olivia Park', category: 'influencer', thumbnail_url: 'https://images.unsplash.com/photo-1524504388940-b1c1722653e1?w=800&h=800&fit=crop&crop=face', avg_rating: 4.6, rating_count: 145, license_count: 203, view_count: 16432, pricing_tiers: [{ name: 'Basic', price: 159, features: ['10 AI generations'] }], tags: ['Beauty'], verified: true, languages: ['English', 'Korean'], available_components: ['Face'] },
+})
 
 function ComponentBadge({ component }: { component: string }) {
   const icons: Record<string, any> = {
@@ -342,6 +174,7 @@ function PricingCard({
     addItem({
       id: `${actor.id}-${tier.name}-${Date.now()}`,
       actorId: actor.id,
+      identityId: actor.identity_id,
       actorName: actor.title,
       actorImage: actor.thumbnail_url,
       tierName: tier.name,
@@ -394,11 +227,198 @@ function PricingCard({
   )
 }
 
+// Share Modal Component
+function ShareModal({ isOpen, onClose, actor }: { isOpen: boolean; onClose: () => void; actor: any }) {
+  const [copied, setCopied] = useState(false)
+  const shareUrl = typeof window !== 'undefined' ? window.location.href : ''
+
+  const copyToClipboard = async () => {
+    try {
+      await navigator.clipboard.writeText(shareUrl)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch (err) {
+      logger.error('Failed to copy URL', err as Error)
+    }
+  }
+
+  const shareLinks = [
+    { name: 'Twitter', icon: Twitter, url: `https://twitter.com/intent/tweet?text=Check out ${actor.title} on ActorHub.ai&url=${encodeURIComponent(shareUrl)}` },
+    { name: 'Facebook', icon: Facebook, url: `https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(shareUrl)}` },
+    { name: 'LinkedIn', icon: Linkedin, url: `https://www.linkedin.com/sharing/share-offsite/?url=${encodeURIComponent(shareUrl)}` },
+    { name: 'Email', icon: Mail, url: `mailto:?subject=Check out ${actor.title} on ActorHub.ai&body=${encodeURIComponent(shareUrl)}` },
+  ]
+
+  if (!isOpen) return null
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={onClose}>
+      <Card className="bg-slate-800 border-slate-700 max-w-md w-full mx-4" onClick={(e) => e.stopPropagation()}>
+        <CardHeader className="flex flex-row items-center justify-between">
+          <CardTitle className="text-white">Share {actor.title}</CardTitle>
+          <Button variant="ghost" size="icon" onClick={onClose}>
+            <X className="w-5 h-5 text-slate-400" />
+          </Button>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="flex gap-3 justify-center">
+            {shareLinks.map((link) => (
+              <a
+                key={link.name}
+                href={link.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="w-12 h-12 rounded-full bg-slate-700 hover:bg-slate-600 flex items-center justify-center transition-colors"
+                aria-label={`Share on ${link.name}`}
+              >
+                <link.icon className="w-5 h-5 text-slate-300" />
+              </a>
+            ))}
+          </div>
+          <div className="flex gap-2">
+            <Input
+              value={shareUrl}
+              readOnly
+              className="bg-slate-900 border-slate-600 text-slate-300"
+            />
+            <Button onClick={copyToClipboard} className="bg-purple-600 hover:bg-purple-700">
+              {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+
+// Contact Modal Component
+function ContactModal({ isOpen, onClose, actor }: { isOpen: boolean; onClose: () => void; actor: any }) {
+  const [message, setMessage] = useState('')
+  const [sending, setSending] = useState(false)
+  const [sent, setSent] = useState(false)
+
+  const handleSend = async () => {
+    setSending(true)
+    try {
+      // API call to send contact message
+      await api.post('/marketplace/contact', {
+        listing_id: actor.id,
+        message,
+      })
+      setSent(true)
+      setTimeout(() => {
+        onClose()
+        setSent(false)
+        setMessage('')
+      }, 2000)
+    } catch (err) {
+      logger.error('Failed to send message', err as Error)
+    } finally {
+      setSending(false)
+    }
+  }
+
+  if (!isOpen) return null
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={onClose}>
+      <Card className="bg-slate-800 border-slate-700 max-w-md w-full mx-4" onClick={(e) => e.stopPropagation()}>
+        <CardHeader className="flex flex-row items-center justify-between">
+          <CardTitle className="text-white">Contact {actor.title}</CardTitle>
+          <Button variant="ghost" size="icon" onClick={onClose}>
+            <X className="w-5 h-5 text-slate-400" />
+          </Button>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {sent ? (
+            <div className="text-center py-8">
+              <Check className="w-12 h-12 text-green-400 mx-auto mb-3" />
+              <p className="text-white font-medium">Message sent!</p>
+              <p className="text-slate-400 text-sm">You'll receive a response soon.</p>
+            </div>
+          ) : (
+            <>
+              <textarea
+                value={message}
+                onChange={(e) => setMessage(e.target.value)}
+                placeholder="Write your message..."
+                className="w-full h-32 bg-slate-900 border border-slate-600 rounded-lg p-3 text-white placeholder-slate-500 resize-none focus:outline-none focus:ring-2 focus:ring-purple-500"
+              />
+              <div className="flex gap-3">
+                <Button variant="outline" className="flex-1 border-slate-600" onClick={onClose}>
+                  Cancel
+                </Button>
+                <Button
+                  className="flex-1 bg-purple-600 hover:bg-purple-700"
+                  onClick={handleSend}
+                  disabled={!message.trim() || sending}
+                >
+                  {sending ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Send Message'}
+                </Button>
+              </div>
+            </>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+
+// Preview Demo Modal
+function PreviewModal({ isOpen, onClose, actor }: { isOpen: boolean; onClose: () => void; actor: any }) {
+  if (!isOpen) return null
+
+  return (
+    <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50" onClick={onClose}>
+      <div className="relative max-w-4xl w-full mx-4" onClick={(e) => e.stopPropagation()}>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="absolute -top-12 right-0 text-white hover:bg-white/10"
+          onClick={onClose}
+        >
+          <X className="w-6 h-6" />
+        </Button>
+        <Card className="bg-slate-800 border-slate-700 overflow-hidden">
+          <CardContent className="p-0">
+            {actor.demo_video_url ? (
+              <div className="aspect-video">
+                <iframe
+                  src={actor.demo_video_url}
+                  className="w-full h-full"
+                  allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                  allowFullScreen
+                />
+              </div>
+            ) : (
+              <div className="aspect-video flex items-center justify-center bg-slate-900">
+                <div className="text-center">
+                  <Play className="w-16 h-16 text-slate-600 mx-auto mb-4" />
+                  <p className="text-slate-400 text-lg">Demo preview coming soon</p>
+                  <p className="text-slate-500 text-sm mt-2">
+                    Sample AI-generated content for {actor.title} will be available shortly.
+                  </p>
+                </div>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  )
+}
+
 export default function ActorDetailPage() {
   const params = useParams()
   const id = params.id as string
+  const queryClient = useQueryClient()
+  const pricingSectionRef = useRef<HTMLElement>(null)
+
   const [selectedImage, setSelectedImage] = useState(0)
   const [isLiked, setIsLiked] = useState(false)
+  const [showShareModal, setShowShareModal] = useState(false)
+  const [showContactModal, setShowContactModal] = useState(false)
+  const [showPreviewModal, setShowPreviewModal] = useState(false)
 
   // Try to get from API first, fallback to sample data
   const { data: apiActor, isLoading } = useQuery({
@@ -406,6 +426,46 @@ export default function ActorDetailPage() {
     queryFn: () => marketplaceApi.getListing(id),
     retry: false,
   })
+
+  // Check if user has favorited this listing
+  const { data: favoritesData } = useQuery({
+    queryKey: ['favorites'],
+    queryFn: () => api.get('/marketplace/favorites').then(r => r.data),
+    retry: false,
+  })
+
+  // Update isLiked when favorites data loads
+  useEffect(() => {
+    if (favoritesData?.favorites) {
+      setIsLiked(favoritesData.favorites.some((f: any) => f.listing_id === id))
+    }
+  }, [favoritesData, id])
+
+  // Toggle favorite mutation
+  const toggleFavoriteMutation = useMutation({
+    mutationFn: async () => {
+      if (isLiked) {
+        return api.delete(`/marketplace/favorites/${id}`)
+      } else {
+        return api.post('/marketplace/favorites', { listing_id: id })
+      }
+    },
+    onSuccess: () => {
+      setIsLiked(!isLiked)
+      queryClient.invalidateQueries({ queryKey: ['favorites'] })
+    },
+    onError: (err) => {
+      logger.error('Failed to toggle favorite', err as Error)
+    },
+  })
+
+  const handleLikeClick = () => {
+    toggleFavoriteMutation.mutate()
+  }
+
+  const scrollToPricing = () => {
+    pricingSectionRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }
 
   // Use API data or sample data
   const actor = apiActor || SAMPLE_ACTORS[id]
@@ -435,7 +495,8 @@ export default function ActorDetailPage() {
     )
   }
 
-  const gallery = actor.gallery || [actor.thumbnail_url]
+  const rawGallery = actor.gallery || [actor.thumbnail_url]
+  const gallery = rawGallery.map((url: string) => getProxiedImageUrl(url) || url)
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950">
@@ -456,10 +517,19 @@ export default function ActorDetailPage() {
           </Link>
           <div className="flex items-center gap-2">
             <CartButton />
-            <Button variant="ghost" size="icon" onClick={() => setIsLiked(!isLiked)}>
-              <Heart className={cn("w-5 h-5", isLiked ? "fill-red-500 text-red-500" : "text-slate-400")} />
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={handleLikeClick}
+              disabled={toggleFavoriteMutation.isPending}
+            >
+              {toggleFavoriteMutation.isPending ? (
+                <Loader2 className="w-5 h-5 animate-spin text-slate-400" />
+              ) : (
+                <Heart className={cn("w-5 h-5", isLiked ? "fill-red-500 text-red-500" : "text-slate-400")} />
+              )}
             </Button>
-            <Button variant="ghost" size="icon">
+            <Button variant="ghost" size="icon" onClick={() => setShowShareModal(true)}>
               <Share2 className="w-5 h-5 text-slate-400" />
             </Button>
           </div>
@@ -584,11 +654,20 @@ export default function ActorDetailPage() {
 
             {/* Quick Action */}
             <div className="flex gap-3">
-              <Button size="lg" className="flex-1 bg-gradient-to-r from-blue-500 to-purple-600 hover:from-blue-600 hover:to-purple-700">
+              <Button
+                size="lg"
+                className="flex-1 bg-gradient-to-r from-blue-500 to-purple-600 hover:from-blue-600 hover:to-purple-700"
+                onClick={() => setShowPreviewModal(true)}
+              >
                 <Play className="w-5 h-5 mr-2" />
                 Preview Demo
               </Button>
-              <Button size="lg" variant="outline" className="border-slate-700">
+              <Button
+                size="lg"
+                variant="outline"
+                className="border-slate-700"
+                onClick={() => setShowContactModal(true)}
+              >
                 <MessageSquare className="w-5 h-5 mr-2" />
                 Contact
               </Button>
@@ -597,7 +676,7 @@ export default function ActorDetailPage() {
         </div>
 
         {/* Pricing Section */}
-        <section className="mb-12">
+        <section ref={pricingSectionRef} className="mb-12">
           <h2 className="text-2xl font-bold text-white mb-6 flex items-center gap-2">
             <DollarSign className="w-6 h-6 text-green-400" />
             Licensing Options
@@ -628,7 +707,11 @@ export default function ActorDetailPage() {
             <CardContent className="p-8 text-center">
               <h2 className="text-2xl font-bold text-white mb-4">Ready to License {actor.title}?</h2>
               <p className="text-slate-300 mb-6">Choose a plan above to get started with AI-generated content using this verified identity.</p>
-              <Button size="lg" className="bg-gradient-to-r from-blue-500 to-purple-600 hover:from-blue-600 hover:to-purple-700">
+              <Button
+                size="lg"
+                className="bg-gradient-to-r from-blue-500 to-purple-600 hover:from-blue-600 hover:to-purple-700"
+                onClick={scrollToPricing}
+              >
                 <ShoppingCart className="w-5 h-5 mr-2" />
                 View Pricing Options
               </Button>
@@ -643,6 +726,11 @@ export default function ActorDetailPage() {
           © 2025 ActorHub.ai. All rights reserved.
         </div>
       </footer>
+
+      {/* Modals */}
+      <ShareModal isOpen={showShareModal} onClose={() => setShowShareModal(false)} actor={actor} />
+      <ContactModal isOpen={showContactModal} onClose={() => setShowContactModal(false)} actor={actor} />
+      <PreviewModal isOpen={showPreviewModal} onClose={() => setShowPreviewModal(false)} actor={actor} />
     </div>
   )
 }

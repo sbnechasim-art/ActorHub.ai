@@ -10,8 +10,8 @@ import {
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { marketplaceApi } from '@/lib/api'
-import { cn } from '@/lib/utils'
+import { marketplaceApi, generationApi, GenerationResponse } from '@/lib/api'
+import { cn, getProxiedImageUrl } from '@/lib/utils'
 
 type ContentType = 'face' | 'voice' | 'motion'
 
@@ -39,47 +39,20 @@ export default function CreateContentPage() {
   const { data: licenses, isLoading: licensesLoading } = useQuery({
     queryKey: ['my-licenses'],
     queryFn: () => marketplaceApi.getMyLicenses(),
-    // Fallback to demo data if not authenticated
-    placeholderData: [
-      {
-        id: 'demo-license-1',
-        identity_id: 'featured-1',
-        identity: {
-          display_name: 'Sarah Mitchell',
-          profile_image_url: 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=200&h=200&fit=crop&crop=face'
-        },
-        license_type: 'pro',
-        usage_type: 'commercial',
-        valid_until: new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString(),
-        is_active: true
-      }
-    ]
   })
 
-  // Submit generation request
+  // Submit generation request - Real API
   const generateMutation = useMutation({
-    mutationFn: async () => {
-      const formData = new FormData()
-      formData.append('license_id', selectedLicense!)
-      formData.append('content_type', contentType)
-      formData.append('prompt', prompt)
-      if (file) {
-        formData.append('input_file', file)
-      }
-
-      // For demo, just simulate a successful response
-      return new Promise((resolve) => {
-        setTimeout(() => {
-          resolve({
-            job_id: `job-${Date.now()}`,
-            status: 'queued',
-            estimated_time: '2-5 minutes'
-          })
-        }, 1500)
+    mutationFn: async (): Promise<GenerationResponse> => {
+      return generationApi.generate({
+        license_id: selectedLicense!,
+        content_type: contentType,
+        prompt: prompt,
+        num_outputs: contentType === 'face' ? 2 : 1,
       })
     },
-    onSuccess: (data: any) => {
-      router.push(`/dashboard?job=${data.job_id}`)
+    onSuccess: (data: GenerationResponse) => {
+      router.push(`/gallery?job=${data.job_id}`)
     }
   })
 
@@ -163,9 +136,9 @@ export default function CreateContentPage() {
                       )}
                     >
                       <div className="w-14 h-14 rounded-lg overflow-hidden bg-slate-700 flex-shrink-0">
-                        {license.identity?.profile_image_url ? (
+                        {getProxiedImageUrl(license.identity?.profile_image_url) ? (
                           <img
-                            src={license.identity.profile_image_url}
+                            src={getProxiedImageUrl(license.identity?.profile_image_url)}
                             alt={license.identity?.display_name}
                             className="w-full h-full object-cover"
                           />

@@ -5,14 +5,17 @@ Handle webhooks from Stripe, Clerk, and other services
 
 import os
 from datetime import datetime, timedelta
+from typing import Optional
 
 import structlog
 import redis.asyncio as redis
 from fastapi import APIRouter, Header, HTTPException, Request
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 from svix.webhooks import Webhook, WebhookVerificationError
 
 from app.core.config import settings
+from app.core.helpers import utc_now  # MEDIUM FIX: Use timezone-aware datetime
 from app.core.database import async_session_maker
 from app.models.identity import Identity
 from app.models.marketplace import License, PaymentStatus, Transaction, TransactionType
@@ -54,7 +57,7 @@ async def check_idempotency(event_id: str) -> bool:
         # SETNX returns True if key was set (new event), False if already exists
         was_set = await redis_client.set(
             key,
-            datetime.utcnow().isoformat(),
+            utc_now().isoformat(),
             nx=True,  # Only set if not exists
             ex=IDEMPOTENCY_TTL_SECONDS  # Auto-expire after 24 hours
         )
@@ -66,15 +69,20 @@ async def check_idempotency(event_id: str) -> bool:
         return False
 
     except redis.RedisError as e:
-        # If Redis fails, log error but allow processing
-        # Better to risk duplicate than to reject valid webhooks
-        logger.error(f"Redis idempotency check failed: {e}. Allowing webhook processing.")
-        return False
+        # If Redis fails, REJECT processing to prevent duplicates
+        # It's safer to have a webhook retry than to risk duplicate processing
+        # which could result in duplicate charges, notifications, or state corruption
+        logger.error(
+            f"Redis idempotency check failed: {e}. "
+            "Rejecting webhook to prevent potential duplicate processing. "
+            "Webhook will be retried by the sender."
+        )
+        return True  # Treat as already processed - safer than allowing duplicates
 
 
 @router.post("/stripe")
 async def stripe_webhook(
-    request: Request, stripe_signature: str = Header(None, alias="Stripe-Signature")
+    request: Request, stripe_signature: str = Header(..., alias="Stripe-Signature")
 ):
     """
     Handle Stripe webhook events.
@@ -86,10 +94,16 @@ async def stripe_webhook(
     - customer.subscription.updated: Subscription changed
     - customer.subscription.deleted: Subscription cancelled
     """
+    # SECURITY FIX: Signature header is now required (... instead of None)
     if not settings.STRIPE_WEBHOOK_SECRET:
-        raise HTTPException(500, "Stripe webhook secret not configured")
+        logger.error("Stripe webhook secret not configured")
+        raise HTTPException(500, "Webhook configuration error")
 
     payload = await request.body()
+
+    # SECURITY: Verify payload is not empty
+    if not payload:
+        raise HTTPException(400, "Empty webhook payload")
 
     # Verify signature
     try:
@@ -98,8 +112,19 @@ async def stripe_webhook(
         event = stripe.Webhook.construct_event(
             payload, stripe_signature, settings.STRIPE_WEBHOOK_SECRET
         )
+    except stripe.error.SignatureVerificationError as e:
+        # SECURITY: Log the failure but don't expose details
+        logger.warning(
+            "Stripe webhook signature verification failed",
+            error_type=type(e).__name__,
+        )
+        raise HTTPException(400, "Invalid webhook signature")
+    except ValueError as e:
+        logger.warning("Stripe webhook payload parsing failed", error=str(e))
+        raise HTTPException(400, "Invalid webhook payload")
     except Exception as e:
-        raise HTTPException(400, f"Invalid signature: {str(e)}")
+        logger.error(f"Stripe webhook error: {type(e).__name__}")
+        raise HTTPException(400, "Invalid webhook request")
 
     # Idempotency check - skip if already processed
     event_id = event.get("id")
@@ -134,7 +159,9 @@ async def stripe_webhook(
 
         except Exception as e:
             await db.rollback()
-            raise HTTPException(500, f"Webhook processing error: {str(e)}")
+            # SECURITY FIX: Log error details but don't expose to client
+            logger.error(f"Stripe webhook processing error: {e}", exc_info=True)
+            raise HTTPException(500, "Webhook processing error")
 
     return {"status": "received"}
 
@@ -158,28 +185,68 @@ async def handle_checkout_completed(db: AsyncSession, data: dict):
     license = result.scalar_one_or_none()
 
     if license:
-        license.payment_status = PaymentStatus.COMPLETED
+        license.payment_status = "COMPLETED"
         license.stripe_payment_intent_id = payment_intent_id
-        license.paid_at = datetime.utcnow()
+        license.paid_at = utc_now()
         license.is_active = True
 
-        # Update identity stats
+        # Update identity stats atomically to prevent race conditions
         identity = await db.get(Identity, license.identity_id)
         if identity:
-            identity.total_licenses += 1
-            identity.total_revenue += license.creator_payout_usd or 0
+            await db.execute(
+                update(Identity)
+                .where(Identity.id == identity.id)
+                .values(
+                    total_licenses=Identity.total_licenses + 1,
+                    total_revenue=Identity.total_revenue + (license.creator_payout_usd or 0)
+                )
+            )
 
         # Create transaction record
         transaction = Transaction(
             license_id=license.id,
             user_id=license.licensee_id,
-            type=TransactionType.PURCHASE,
+            type="PURCHASE",
             amount_usd=license.price_usd,
-            status=PaymentStatus.COMPLETED,
+            status="COMPLETED",
             stripe_payment_intent_id=payment_intent_id,
-            completed_at=datetime.utcnow(),
+            completed_at=utc_now(),
         )
         db.add(transaction)
+
+        # Create creator earning record with holding period
+        if identity:
+            from app.models.notifications import CreatorEarning, EarningStatus
+
+            holding_days = settings.PAYOUT_HOLDING_DAYS
+            platform_fee_percent = settings.PAYOUT_PLATFORM_FEE_PERCENT
+
+            gross_amount = license.price_usd
+            platform_fee = gross_amount * (platform_fee_percent / 100)
+            net_amount = gross_amount - platform_fee
+
+            earning = CreatorEarning(
+                creator_id=identity.user_id,
+                license_id=license.id,
+                identity_id=identity.id,
+                gross_amount=gross_amount,
+                platform_fee=platform_fee,
+                net_amount=net_amount,
+                currency="USD",
+                status=EarningStatus.PENDING,
+                earned_at=utc_now(),
+                available_at=utc_now() + timedelta(days=holding_days),
+                description=f"License sale: {license.license_type.value} - {license.usage_type.value}",
+            )
+            db.add(earning)
+
+            logger.info(
+                "Created creator earning record",
+                earning_id=str(earning.id),
+                creator_id=str(identity.user_id),
+                net_amount=net_amount,
+                available_at=earning.available_at.isoformat(),
+            )
 
         # Send email notifications
         email_service = get_email_service()
@@ -219,9 +286,9 @@ async def handle_payment_succeeded(db: AsyncSession, data: dict):
     )
     license = result.scalar_one_or_none()
 
-    if license and license.payment_status != PaymentStatus.COMPLETED:
-        license.payment_status = PaymentStatus.COMPLETED
-        license.paid_at = datetime.utcnow()
+    if license and license.payment_status != "COMPLETED":
+        license.payment_status = "COMPLETED"
+        license.paid_at = utc_now()
         license.is_active = True
 
 
@@ -238,7 +305,7 @@ async def handle_payment_failed(db: AsyncSession, data: dict):
     license = result.scalar_one_or_none()
 
     if license:
-        license.payment_status = PaymentStatus.FAILED
+        license.payment_status = "FAILED"
 
 
 async def handle_subscription_cancelled(db: AsyncSession, data: dict):
@@ -254,7 +321,7 @@ async def handle_subscription_cancelled(db: AsyncSession, data: dict):
 
     if license:
         license.is_active = False
-        license.valid_until = datetime.utcnow()
+        license.valid_until = utc_now()
 
 
 async def handle_connect_account_updated(db: AsyncSession, data: dict):
@@ -341,9 +408,9 @@ async def handle_connect_deauthorized(db: AsyncSession, data: dict):
 @router.post("/clerk")
 async def clerk_webhook(
     request: Request,
-    svix_id: str = Header(None, alias="svix-id"),
-    svix_timestamp: str = Header(None, alias="svix-timestamp"),
-    svix_signature: str = Header(None, alias="svix-signature"),
+    svix_id: str = Header(..., alias="svix-id"),
+    svix_timestamp: str = Header(..., alias="svix-timestamp"),
+    svix_signature: str = Header(..., alias="svix-signature"),
 ):
     """
     Handle Clerk webhook events.
@@ -352,11 +419,18 @@ async def clerk_webhook(
     - user.created: New user signed up
     - user.updated: User info updated
     - user.deleted: User account deleted
+
+    SECURITY: All signature headers are required (... instead of None)
     """
     if not settings.CLERK_WEBHOOK_SECRET:
-        raise HTTPException(500, "Clerk webhook secret not configured")
+        logger.error("Clerk webhook secret not configured")
+        raise HTTPException(500, "Webhook configuration error")
 
     payload = await request.body()
+
+    # SECURITY: Verify payload is not empty
+    if not payload:
+        raise HTTPException(400, "Empty webhook payload")
 
     # Verify Clerk webhook signature using svix
     try:
@@ -367,7 +441,8 @@ async def clerk_webhook(
             "svix-signature": svix_signature,
         }
         event = wh.verify(payload, headers)
-    except WebhookVerificationError:
+    except WebhookVerificationError as e:
+        logger.warning("Clerk webhook signature verification failed")
         raise HTTPException(401, "Invalid webhook signature")
     except Exception:
         raise HTTPException(401, "Webhook verification failed")
@@ -395,7 +470,9 @@ async def clerk_webhook(
 
         except Exception as e:
             await db.rollback()
-            raise HTTPException(500, f"Webhook processing error: {str(e)}")
+            # SECURITY FIX: Log error details but don't expose to client
+            logger.error(f"Clerk webhook processing error: {e}", exc_info=True)
+            raise HTTPException(500, "Webhook processing error")
 
     return {"status": "received"}
 
@@ -410,11 +487,23 @@ async def handle_user_created(db: AsyncSession, data: dict):
     if not email:
         return
 
-    # Check if user exists
+    # Check if user exists (exclude soft-deleted)
     from sqlalchemy import select
 
-    result = await db.execute(select(User).where(User.email == email))
+    result = await db.execute(
+        select(User).where(User.email == email, User.deleted_at.is_(None))
+    )
     existing = result.scalar_one_or_none()
+
+    # Clean up soft-deleted user with same email
+    if not existing:
+        deleted_result = await db.execute(
+            select(User).where(User.email == email, User.deleted_at.isnot(None))
+        )
+        deleted_user = deleted_result.scalar_one_or_none()
+        if deleted_user:
+            await db.delete(deleted_user)
+            await db.flush()
 
     if existing:
         existing.clerk_user_id = clerk_id
@@ -444,7 +533,7 @@ async def handle_user_updated(db: AsyncSession, data: dict):
         user.first_name = data.get("first_name") or user.first_name
         user.last_name = data.get("last_name") or user.last_name
         user.avatar_url = data.get("image_url") or user.avatar_url
-        user.updated_at = datetime.utcnow()
+        user.updated_at = utc_now()
 
 
 async def handle_user_deleted(db: AsyncSession, data: dict):
@@ -459,7 +548,7 @@ async def handle_user_deleted(db: AsyncSession, data: dict):
 
     if user:
         user.is_active = False
-        user.updated_at = datetime.utcnow()
+        user.updated_at = utc_now()
 
 
 def verify_replicate_signature(payload: bytes, signature: str, secret: str) -> bool:
@@ -495,8 +584,8 @@ def verify_replicate_signature(payload: bytes, signature: str, secret: str) -> b
 @router.post("/replicate")
 async def replicate_webhook(
     request: Request,
-    replicate_signature: str = Header(None, alias="X-Replicate-Signature"),
-    webhook_signature: str = Header(None, alias="Webhook-Signature"),
+    replicate_signature: Optional[str] = Header(None, alias="X-Replicate-Signature"),
+    webhook_signature: Optional[str] = Header(None, alias="Webhook-Signature"),
 ):
     """
     Handle Replicate (training) webhook events.
@@ -506,12 +595,22 @@ async def replicate_webhook(
     - failed: Training failed
     - processing: Training in progress
 
-    Security: Validates HMAC-SHA256 signature if webhook secret is configured.
+    SECURITY: Signature verification is REQUIRED in production.
+    Only skipped in DEBUG mode for local development.
     """
     payload_bytes = await request.body()
 
-    # Verify signature if secret is configured (production)
-    if settings.REPLICATE_WEBHOOK_SECRET:
+    # SECURITY: Verify payload is not empty
+    if not payload_bytes:
+        raise HTTPException(400, "Empty webhook payload")
+
+    # SECURITY FIX: In production, signature is ALWAYS required
+    # Only skip in DEBUG mode for local development
+    if not settings.DEBUG:
+        if not settings.REPLICATE_WEBHOOK_SECRET:
+            logger.error("REPLICATE_WEBHOOK_SECRET not configured in production")
+            raise HTTPException(500, "Webhook configuration error")
+
         signature = replicate_signature or webhook_signature
         if not signature:
             logger.warning("Replicate webhook missing signature header")
@@ -523,6 +622,16 @@ async def replicate_webhook(
             settings.REPLICATE_WEBHOOK_SECRET
         ):
             logger.warning("Replicate webhook invalid signature")
+            raise HTTPException(401, "Invalid webhook signature")
+    elif settings.REPLICATE_WEBHOOK_SECRET:
+        # Even in debug mode, verify if secret is configured
+        signature = replicate_signature or webhook_signature
+        if signature and not verify_replicate_signature(
+            payload_bytes,
+            signature,
+            settings.REPLICATE_WEBHOOK_SECRET
+        ):
+            logger.warning("Replicate webhook invalid signature (debug mode)")
             raise HTTPException(401, "Invalid webhook signature")
 
     payload = await request.json()
@@ -555,9 +664,10 @@ async def replicate_webhook(
 
         except Exception as e:
             await db.rollback()
-            logger.error(f"Replicate webhook error: {e}")
+            # SECURITY FIX: Log error details but don't expose to client
+            logger.error(f"Replicate webhook error: {e}", exc_info=True)
             # Return 202 to acknowledge receipt even on error
-            return {"status": "error", "message": str(e)}
+            return {"status": "error", "message": "Processing error occurred"}
 
     return {"status": "received"}
 
@@ -580,8 +690,8 @@ async def handle_training_completed(db: AsyncSession, prediction_id: str, output
     actor_pack = result.scalar_one_or_none()
 
     if actor_pack:
-        actor_pack.training_status = TrainingStatus.COMPLETED
-        actor_pack.training_completed_at = datetime.utcnow()
+        actor_pack.training_status = "COMPLETED"
+        actor_pack.training_completed_at = utc_now()
         actor_pack.lora_model_url = weights_url
         actor_pack.is_available = True
         logger.info(f"Training completed for actor pack {actor_pack.id}")
@@ -615,7 +725,7 @@ async def handle_training_failed(db: AsyncSession, prediction_id: str, error: st
     actor_pack = result.scalar_one_or_none()
 
     if actor_pack:
-        actor_pack.training_status = TrainingStatus.FAILED
+        actor_pack.training_status = "FAILED"
         actor_pack.training_error = error or "Training failed"
         logger.error(f"Training failed for actor pack {actor_pack.id}: {error}")
 
@@ -646,7 +756,7 @@ async def handle_training_progress(db: AsyncSession, prediction_id: str, payload
     actor_pack = result.scalar_one_or_none()
 
     if actor_pack:
-        actor_pack.training_status = TrainingStatus.PROCESSING
+        actor_pack.training_status = "PROCESSING"
         # Extract progress if available
         logs = payload.get("logs", "")
         if "%" in logs:

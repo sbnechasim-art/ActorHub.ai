@@ -31,11 +31,21 @@ export default function CheckoutPage() {
     setError(null)
 
     try {
+      // Map tier names to valid license types (lowercase for Pydantic validation)
+      const getLicenseType = (tierName: string) => {
+        switch (tierName.toLowerCase()) {
+          case 'basic': return 'single_use'
+          case 'pro': return 'subscription'
+          case 'enterprise': return 'unlimited'
+          default: return 'single_use'
+        }
+      }
+
       // For each item, create a purchase request
       const purchasePromises = items.map(async (item) => {
         const response = await marketplaceApi.purchaseLicense({
-          listing_id: item.actorId,
-          license_type: item.tierName.toLowerCase(),
+          identity_id: item.identityId,
+          license_type: getLicenseType(item.tierName),
           usage_type: item.tierName === 'Basic' ? 'personal' : 'commercial',
           duration_days: item.tierName === 'Enterprise' ? 365 : item.tierName === 'Pro' ? 90 : 30,
         })
@@ -48,13 +58,13 @@ export default function CheckoutPage() {
       const checkoutUrl = results[0]?.checkout_url
 
       if (checkoutUrl) {
-        // Clear cart and redirect to Stripe
-        clearCart()
+        // Store cart in sessionStorage before redirect (in case user comes back)
+        sessionStorage.setItem('pending_checkout_cart', JSON.stringify(items))
+        // Redirect to Stripe - cart will be cleared on success page
         window.location.href = checkoutUrl
       } else {
-        // Demo mode - simulate success
-        clearCart()
-        router.push('/checkout/success')
+        // No checkout URL - payment system not configured
+        throw new Error('Payment system temporarily unavailable. Please try again later.')
       }
     } catch (err: unknown) {
       logger.error('Checkout error', err)

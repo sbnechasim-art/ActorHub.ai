@@ -17,11 +17,13 @@ import {
   Save,
   RefreshCw,
   Info,
+  ExternalLink,
+  Zap,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
-import { payoutsApi, analyticsApi, Payout } from '@/lib/api'
+import { payoutsApi, analyticsApi, connectApi, Payout, ConnectStatus } from '@/lib/api'
 import { cn, formatCurrency, formatDate } from '@/lib/utils'
 
 type PayoutMethod = 'paypal' | 'wire'
@@ -105,8 +107,51 @@ export default function PayoutSettingsPage() {
     queryFn: () => analyticsApi.getDashboard(30),
   })
 
+  // Fetch Stripe Connect status
+  const {
+    data: connectStatus,
+    isLoading: isLoadingConnect,
+    refetch: refetchConnect,
+  } = useQuery({
+    queryKey: ['connect-status'],
+    queryFn: () => connectApi.getStatus(),
+  })
+
+  // Start Connect onboarding mutation
+  const startOnboardingMutation = useMutation({
+    mutationFn: () => connectApi.startOnboarding(),
+    onSuccess: (data) => {
+      if (data.url) {
+        window.location.href = data.url
+      }
+      queryClient.invalidateQueries({ queryKey: ['connect-status'] })
+    },
+    onError: (error: any) => {
+      setNotification({
+        type: 'error',
+        message: error.response?.data?.detail || 'Failed to start onboarding',
+      })
+    },
+  })
+
+  // Get Connect dashboard link mutation
+  const getDashboardMutation = useMutation({
+    mutationFn: () => connectApi.getDashboardLink(),
+    onSuccess: (data) => {
+      if (data.url) {
+        window.open(data.url, '_blank')
+      }
+    },
+    onError: (error: any) => {
+      setNotification({
+        type: 'error',
+        message: error.response?.data?.detail || 'Failed to get dashboard link',
+      })
+    },
+  })
+
   const availableBalance = analyticsData?.revenue?.net_earnings || 0
-  const canRequestPayout = availableBalance >= MINIMUM_PAYOUT_THRESHOLD
+  const canRequestPayout = availableBalance >= MINIMUM_PAYOUT_THRESHOLD && connectStatus?.payouts_enabled
 
   // Populate form when settings load
   useEffect(() => {
@@ -248,6 +293,109 @@ export default function PayoutSettingsPage() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Payout Settings Form */}
         <div className="lg:col-span-2 space-y-6">
+          {/* Stripe Connect Card */}
+          <Card className={cn(
+            'border-2',
+            connectStatus?.payouts_enabled
+              ? 'bg-green-500/10 border-green-500/30'
+              : 'bg-slate-800/50 border-slate-700'
+          )}>
+            <CardContent className="p-6">
+              <div className="flex items-start justify-between">
+                <div className="flex items-start gap-4">
+                  <div className={cn(
+                    'w-12 h-12 rounded-lg flex items-center justify-center',
+                    connectStatus?.payouts_enabled
+                      ? 'bg-green-500/20'
+                      : 'bg-purple-500/20'
+                  )}>
+                    {connectStatus?.payouts_enabled ? (
+                      <CheckCircle className="w-6 h-6 text-green-400" />
+                    ) : (
+                      <CreditCard className="w-6 h-6 text-purple-400" />
+                    )}
+                  </div>
+                  <div>
+                    <h3 className="text-lg font-semibold text-white mb-1">
+                      {connectStatus?.payouts_enabled
+                        ? 'Stripe Connected'
+                        : 'Connect Stripe Account'}
+                    </h3>
+                    <p className="text-slate-400 text-sm max-w-md">
+                      {connectStatus?.payouts_enabled
+                        ? 'Your Stripe account is connected and ready to receive payouts.'
+                        : 'Connect your Stripe account to receive instant payouts directly to your bank account or debit card.'}
+                    </p>
+                    {connectStatus?.connected && !connectStatus?.payouts_enabled && (
+                      <div className="mt-2 p-2 bg-yellow-500/10 border border-yellow-500/30 rounded-lg">
+                        <p className="text-yellow-400 text-xs flex items-center gap-1">
+                          <AlertCircle className="w-3 h-3" />
+                          Complete your account setup to enable payouts
+                          {connectStatus.requirements && connectStatus.requirements.length > 0 && (
+                            <span> ({connectStatus.requirements.length} items remaining)</span>
+                          )}
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+                <div className="flex gap-2">
+                  {connectStatus?.payouts_enabled ? (
+                    <Button
+                      variant="outline"
+                      onClick={() => getDashboardMutation.mutate()}
+                      disabled={getDashboardMutation.isPending}
+                    >
+                      {getDashboardMutation.isPending ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <>
+                          <ExternalLink className="w-4 h-4 mr-2" />
+                          View Dashboard
+                        </>
+                      )}
+                    </Button>
+                  ) : (
+                    <Button
+                      variant="gradient"
+                      onClick={() => startOnboardingMutation.mutate()}
+                      disabled={startOnboardingMutation.isPending}
+                    >
+                      {startOnboardingMutation.isPending ? (
+                        <>
+                          <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                          Setting up...
+                        </>
+                      ) : (
+                        <>
+                          <Zap className="w-4 h-4 mr-2" />
+                          {connectStatus?.connected ? 'Continue Setup' : 'Connect Stripe'}
+                        </>
+                      )}
+                    </Button>
+                  )}
+                </div>
+              </div>
+              {/* Benefits list for non-connected users */}
+              {!connectStatus?.payouts_enabled && (
+                <div className="mt-4 pt-4 border-t border-slate-700 grid grid-cols-3 gap-4">
+                  <div className="text-center">
+                    <Zap className="w-5 h-5 text-purple-400 mx-auto mb-1" />
+                    <p className="text-xs text-slate-400">Instant payouts</p>
+                  </div>
+                  <div className="text-center">
+                    <CreditCard className="w-5 h-5 text-purple-400 mx-auto mb-1" />
+                    <p className="text-xs text-slate-400">Direct deposits</p>
+                  </div>
+                  <div className="text-center">
+                    <DollarSign className="w-5 h-5 text-purple-400 mx-auto mb-1" />
+                    <p className="text-xs text-slate-400">Low fees</p>
+                  </div>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+
           {/* Balance Card */}
           <Card className="bg-gradient-to-br from-blue-600 to-purple-600 border-0">
             <CardContent className="p-6">
@@ -305,7 +453,7 @@ export default function PayoutSettingsPage() {
                   type="button"
                   onClick={() => setSettings({ ...settings, method: 'paypal' })}
                   className={cn(
-                    'p-4 rounded-xl border-2 transition-all text-left',
+                    'relative p-4 rounded-xl border-2 transition-all text-left',
                     settings.method === 'paypal'
                       ? 'border-blue-500 bg-blue-500/10'
                       : 'border-slate-700 hover:border-slate-600'
@@ -329,7 +477,7 @@ export default function PayoutSettingsPage() {
                   type="button"
                   onClick={() => setSettings({ ...settings, method: 'wire' })}
                   className={cn(
-                    'p-4 rounded-xl border-2 transition-all text-left',
+                    'relative p-4 rounded-xl border-2 transition-all text-left',
                     settings.method === 'wire'
                       ? 'border-blue-500 bg-blue-500/10'
                       : 'border-slate-700 hover:border-slate-600'

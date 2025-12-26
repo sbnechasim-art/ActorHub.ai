@@ -268,4 +268,150 @@ export class ActorHubClient {
     const response = await this.client.get(`/identity/${identityId}/stats`)
     return response.data
   }
+
+  // ============================================
+  // Content Generation (Actor Pack Usage)
+  // ============================================
+
+  /**
+   * Generate face image using trained Actor Pack.
+   */
+  async generateFaceImage(
+    actorPackId: string,
+    options: {
+      prompt: string
+      negative_prompt?: string
+      num_outputs?: number
+      guidance_scale?: number
+    }
+  ): Promise<{ job_id: string; status: string }> {
+    const response = await this.client.post(`/generation/face`, {
+      actor_pack_id: actorPackId,
+      ...options,
+    })
+    return response.data
+  }
+
+  /**
+   * Generate voice using trained Actor Pack.
+   */
+  async generateVoice(
+    actorPackId: string,
+    options: {
+      text: string
+      model_id?: string
+    }
+  ): Promise<{ job_id: string; status: string }> {
+    const response = await this.client.post(`/generation/voice`, {
+      actor_pack_id: actorPackId,
+      ...options,
+    })
+    return response.data
+  }
+
+  /**
+   * Get generation job status.
+   */
+  async getGenerationJob(jobId: string): Promise<{
+    id: string
+    status: 'pending' | 'processing' | 'completed' | 'failed'
+    type: 'face' | 'voice' | 'video'
+    output_urls?: string[]
+    error?: string
+    created_at: string
+    completed_at?: string
+  }> {
+    const response = await this.client.get(`/generation/jobs/${jobId}`)
+    return response.data
+  }
+
+  // ============================================
+  // Webhooks
+  // ============================================
+
+  /**
+   * Register a webhook for events.
+   */
+  async registerWebhook(options: {
+    url: string
+    events: ('verification' | 'license.purchased' | 'training.completed' | 'unauthorized.detection')[]
+    secret?: string
+  }): Promise<{ id: string; url: string; events: string[]; secret: string }> {
+    const response = await this.client.post('/webhooks', options)
+    return response.data
+  }
+
+  /**
+   * List registered webhooks.
+   */
+  async listWebhooks(): Promise<{ id: string; url: string; events: string[]; is_active: boolean }[]> {
+    const response = await this.client.get('/webhooks')
+    return response.data
+  }
+
+  /**
+   * Delete a webhook.
+   */
+  async deleteWebhook(webhookId: string): Promise<void> {
+    await this.client.delete(`/webhooks/${webhookId}`)
+  }
+
+  // ============================================
+  // Notifications
+  // ============================================
+
+  /**
+   * Get user notifications.
+   */
+  async getNotifications(options?: {
+    unread_only?: boolean
+    page?: number
+    limit?: number
+  }): Promise<{ items: Notification[]; total: number; unread_count: number }> {
+    const response = await this.client.get('/notifications', { params: options })
+    return response.data
+  }
+
+  /**
+   * Mark notification as read.
+   */
+  async markNotificationRead(notificationId: string): Promise<void> {
+    await this.client.patch(`/notifications/${notificationId}/read`)
+  }
+
+  /**
+   * Mark all notifications as read.
+   */
+  async markAllNotificationsRead(): Promise<void> {
+    await this.client.post('/notifications/mark-all-read')
+  }
+
+  // ============================================
+  // Health & Status
+  // ============================================
+
+  /**
+   * Check API health.
+   */
+  async healthCheck(): Promise<{
+    status: string
+    version: string
+    timestamp: string
+  }> {
+    const response = await this.client.get('/health')
+    return response.data
+  }
+}
+
+/**
+ * Notification type for SDK
+ */
+interface Notification {
+  id: string
+  type: string
+  title: string
+  message: string
+  action_url?: string
+  is_read: boolean
+  created_at: string
 }

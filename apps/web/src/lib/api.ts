@@ -1,6 +1,16 @@
 import axios from 'axios'
+import {
+  setupRetryInterceptor,
+  setupRateLimitInterceptor,
+  setupOfflineInterceptor,
+} from './api-utils'
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1'
+
+// Debug: Log API URL on initialization
+if (typeof window !== 'undefined') {
+  console.log('[API Client] Initialized with baseURL:', API_URL)
+}
 
 export const api = axios.create({
   baseURL: API_URL,
@@ -8,6 +18,18 @@ export const api = axios.create({
   headers: {
     'Content-Type': 'application/json',
   },
+  // SECURITY: Use cookies for auth instead of localStorage
+  // This enables httpOnly cookies to be sent automatically
+  withCredentials: true,
+})
+
+// Setup interceptors for resilience
+setupOfflineInterceptor(api)      // Check offline before requests
+setupRateLimitInterceptor(api)    // Prevent API abuse
+setupRetryInterceptor(api, {      // Auto-retry on failures
+  maxRetries: 3,
+  baseDelay: 1000,
+  maxDelay: 10000,
 })
 
 // Types
@@ -20,7 +42,11 @@ export interface Identity {
   category?: string
   status: 'PENDING' | 'VERIFIED' | 'PROTECTED' | 'SUSPENDED'
   protection_level: 'BASIC' | 'STANDARD' | 'PREMIUM'
-  is_public: boolean
+  is_public?: boolean // deprecated, use show_in_public_gallery
+  show_in_public_gallery?: boolean
+  allow_commercial_use?: boolean
+  allow_ai_training?: boolean
+  profile_image_url?: string
   created_at: string
   updated_at: string
   verified_at?: string
@@ -32,8 +58,8 @@ export interface Identity {
 
 export interface ActorPack {
   id: string
-  identity_id: string
-  training_status: 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'FAILED'
+  identity_id?: string
+  training_status: 'PENDING' | 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAILED'
   training_progress: number
   training_started_at?: string
   training_completed_at?: string
@@ -41,7 +67,15 @@ export interface ActorPack {
   quality_score?: number
   authenticity_score?: number
   consistency_score?: number
+  voice_quality_score?: number
   is_available: boolean
+  components?: {
+    face?: boolean
+    voice?: boolean
+    motion?: boolean
+  }
+  training_images_count?: number
+  version?: string
 }
 
 export interface License {
@@ -109,28 +143,61 @@ export interface Payout {
   completed_at?: string
 }
 
-// Add auth token to requests
+// Request interceptor - cookies are sent automatically via withCredentials
+// No need to manually add Authorization header for browser clients
 api.interceptors.request.use((config) => {
-  // Get token from localStorage (set during login)
+  // Debug: Log all outgoing requests
   if (typeof window !== 'undefined') {
-    const token = localStorage.getItem('token')
-    if (token) {
-      config.headers.Authorization = `Bearer ${token}`
-    }
+    console.log('[API Request]', config.method?.toUpperCase(), config.baseURL + config.url, config.params)
   }
+  // For server-side rendering or API key usage, token can be set manually
+  // But for browser clients, httpOnly cookies are used automatically
   return config
 })
 
-// Handle errors
+// Handle errors with improved messaging
 api.interceptors.response.use(
   (response) => response,
   (error) => {
-    if (error.response?.status === 401) {
-      // Redirect to login
+    // Import dynamically to avoid circular dependencies
+    const status = error.response?.status
+    const data = error.response?.data
+
+    // Handle authentication errors
+    if (status === 401) {
+      // Only redirect if not already on auth pages
       if (typeof window !== 'undefined') {
-        window.location.href = '/sign-in'
+        const isAuthPage = window.location.pathname.includes('/sign-in') ||
+                          window.location.pathname.includes('/sign-up')
+        if (!isAuthPage) {
+          // Store current URL for redirect after login
+          sessionStorage.setItem('redirectAfterLogin', window.location.pathname)
+          window.location.href = '/sign-in'
+        }
       }
     }
+
+    // Enhance error message based on response
+    if (data?.error?.message) {
+      error.message = data.error.message
+    } else if (data?.detail) {
+      if (typeof data.detail === 'string') {
+        error.message = data.detail
+      } else if (Array.isArray(data.detail)) {
+        error.message = data.detail.map((d: { msg: string }) => d.msg).join(', ')
+      }
+    }
+
+    // Log errors in development
+    if (process.env.NODE_ENV === 'development') {
+      console.error('[API Error]', {
+        status,
+        url: error.config?.url,
+        message: error.message,
+        data: data,
+      })
+    }
+
     return Promise.reject(error)
   }
 )
@@ -145,8 +212,12 @@ export const identityApi = {
     }).then((r) => r.data),
   update: (id: string, data: any) =>
     api.patch(`/identity/${id}`, data).then((r) => r.data),
+  delete: (id: string) =>
+    api.delete(`/identity/${id}`).then((r) => r.data),
   verify: (data: { image_url?: string; image_base64?: string }) =>
     api.post('/identity/verify', data).then((r) => r.data),
+  getPublicGallery: (skip = 0, limit = 50) =>
+    api.get(`/identity/gallery?skip=${skip}&limit=${limit}`).then((r) => r.data),
 }
 
 export const userApi = {
@@ -156,6 +227,8 @@ export const userApi = {
   getApiKeys: () => api.get('/users/api-keys').then((r) => r.data),
   createApiKey: (data: any) => api.post('/users/api-keys', data).then((r) => r.data),
   revokeApiKey: (id: string) => api.delete(`/users/api-keys/${id}`).then((r) => r.data),
+  // Delete account (soft delete)
+  deleteAccount: () => api.delete('/users/me').then((r) => r.data),
 }
 
 export const marketplaceApi = {
@@ -165,25 +238,96 @@ export const marketplaceApi = {
     api.get(`/marketplace/listings/${id}`).then((r) => r.data),
   createListing: (data: any) =>
     api.post('/marketplace/listings', data).then((r) => r.data),
+  deleteListing: (id: string) =>
+    api.delete(`/marketplace/listings/${id}`).then((r) => r.data),
   getLicensePrice: (data: any) =>
     api.post('/marketplace/license/price', data).then((r) => r.data),
   purchaseLicense: (data: any) =>
     api.post('/marketplace/license/purchase', data).then((r) => r.data),
   getMyLicenses: () =>
     api.get('/marketplace/licenses/mine').then((r) => r.data),
+  revokeLicense: (id: string) =>
+    api.delete(`/marketplace/licenses/${id}`).then((r) => r.data),
+}
+
+export const refundApi = {
+  requestRefund: (licenseId: string, reason: string) =>
+    api.post('/refunds/request', { license_id: licenseId, reason }).then((r) => r.data),
+  getRefundStatus: (refundId: string) =>
+    api.get(`/refunds/status/${refundId}`).then((r) => r.data),
+  getRefundHistory: () =>
+    api.get('/refunds/history').then((r) => r.data),
+  getRefundPolicy: () =>
+    api.get('/refunds/policy').then((r) => r.data),
+}
+
+export interface ActorPackDownload {
+  download_url: string
+  expires_in_seconds: number
+  file_size_mb: number
+  version: string
+  components: {
+    face?: boolean
+    voice?: boolean
+    motion?: boolean
+  }
+  checksum?: string
 }
 
 export const actorPackApi = {
   getPublic: (params?: any) =>
-    api.get('/actor-pack/public', { params }).then((r) => r.data),
+    api.get('/actor-packs/public', { params }).then((r) => r.data),
   getStatus: (id: string) =>
-    api.get(`/actor-pack/status/${id}`).then((r) => r.data),
+    api.get(`/actor-packs/status/${id}`).then((r) => r.data),
   initTraining: (formData: FormData) =>
-    api.post('/actor-pack/train', formData, {
+    api.post('/actor-packs/train', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
     }).then((r) => r.data),
-  download: (identityId: string) =>
-    api.get(`/actor-pack/download/${identityId}`).then((r) => r.data),
+  // Download Actor Pack as licensee (requires valid license)
+  download: (identityId: string): Promise<ActorPackDownload> =>
+    api.get(`/actor-packs/download/${identityId}`).then((r) => r.data),
+  // Download your own Actor Pack (for identity owners, no license needed)
+  downloadOwn: (identityId: string): Promise<ActorPackDownload> =>
+    api.get(`/actor-packs/download-own/${identityId}`).then((r) => r.data),
+  pollTraining: (packId: string): Promise<ActorPack> =>
+    api.post(`/actor-packs/poll-training/${packId}`).then((r) => r.data),
+  // Get all user's actor packs with training status
+  getMyPacks: (): Promise<ActorPack[]> =>
+    api.get('/actor-packs/mine').then((r) => r.data),
+  // Cancel an in-progress training
+  cancelTraining: (packId: string) =>
+    api.post(`/actor-packs/cancel/${packId}`).then((r) => r.data),
+  // Delete an actor pack
+  delete: (packId: string) =>
+    api.delete(`/actor-packs/${packId}`).then((r) => r.data),
+}
+
+// Content Generation API
+export interface GenerationRequest {
+  license_id: string
+  content_type: 'face' | 'voice' | 'motion'
+  prompt: string
+  negative_prompt?: string
+  num_outputs?: number
+}
+
+export interface GenerationResponse {
+  job_id: string
+  status: string
+  content_type: string
+  outputs?: string[]
+  output_url?: string
+  estimated_time?: string
+  error?: string
+}
+
+export const generationApi = {
+  generate: (request: GenerationRequest) =>
+    api.post<GenerationResponse>('/generate/generate', request).then((r) => r.data),
+  getStatus: (jobId: string) =>
+    api.get<GenerationResponse>(`/generate/status/${jobId}`).then((r) => r.data),
+  getMyJobs: (limit = 10) =>
+    api.get('/generate/my-jobs', { params: { limit } }).then((r) => r.data),
 }
 
 export const analyticsApi = {
@@ -230,6 +374,37 @@ export const subscriptionsApi = {
     api.post('/subscriptions/cancel').then((r) => r.data),
   reactivate: () =>
     api.post('/subscriptions/reactivate').then((r) => r.data),
+}
+
+export interface CreatorEarning {
+  id: string
+  net_amount: number
+  gross_amount: number
+  platform_fee: number
+  status: 'PENDING' | 'AVAILABLE' | 'PAID' | 'REFUNDED'
+  description: string
+  earned_at: string
+  available_at?: string
+  paid_at?: string
+}
+
+export interface EarningsSummary {
+  pending_balance: number
+  available_balance: number
+  total_earned: number
+  total_paid: number
+  total_refunded: number
+  currency: string
+  minimum_payout: number
+  holding_days: number
+  next_available?: string
+  can_request_payout: boolean
+  recent_earnings: CreatorEarning[]
+}
+
+export const earningsApi = {
+  getSummary: () =>
+    api.get<EarningsSummary>('/users/earnings').then((r) => r.data),
 }
 
 export const payoutsApi = {

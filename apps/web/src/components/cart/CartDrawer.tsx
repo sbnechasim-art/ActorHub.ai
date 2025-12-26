@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { X, ShoppingCart, Trash2, Plus, Minus } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -38,6 +38,7 @@ function CartItemCard({ item }: { item: CartItem }) {
         <button
           onClick={() => removeItem(item.id)}
           className="text-slate-400 hover:text-red-400 transition"
+          aria-label={`Remove ${item.actorName} from cart`}
         >
           <Trash2 className="w-4 h-4" />
         </button>
@@ -46,6 +47,7 @@ function CartItemCard({ item }: { item: CartItem }) {
           <button
             onClick={() => updateQuantity(item.id, item.quantity - 1)}
             className="w-6 h-6 rounded bg-slate-700 hover:bg-slate-600 flex items-center justify-center text-slate-300 transition"
+            aria-label={`Decrease quantity of ${item.actorName}`}
           >
             <Minus className="w-3 h-3" />
           </button>
@@ -53,6 +55,7 @@ function CartItemCard({ item }: { item: CartItem }) {
           <button
             onClick={() => updateQuantity(item.id, item.quantity + 1)}
             className="w-6 h-6 rounded bg-slate-700 hover:bg-slate-600 flex items-center justify-center text-slate-300 transition"
+            aria-label={`Increase quantity of ${item.actorName}`}
           >
             <Plus className="w-3 h-3" />
           </button>
@@ -64,6 +67,12 @@ function CartItemCard({ item }: { item: CartItem }) {
 
 export function CartDrawer() {
   const { items, isOpen, closeCart, getTotal, getItemCount, clearCart } = useCartStore()
+  const [mounted, setMounted] = useState(false)
+
+  // Prevent hydration mismatch - only render cart data after mount
+  useEffect(() => {
+    setMounted(true)
+  }, [])
 
   // Close on escape key
   useEffect(() => {
@@ -90,8 +99,10 @@ export function CartDrawer() {
     }
   }, [isOpen])
 
-  const itemCount = getItemCount()
-  const total = getTotal()
+  // Use 0 before mount to match server-rendered HTML
+  const itemCount = mounted ? getItemCount() : 0
+  const total = mounted ? getTotal() : 0
+  const displayItems = mounted ? items : []
 
   return (
     <>
@@ -122,6 +133,7 @@ export function CartDrawer() {
           <button
             onClick={closeCart}
             className="text-slate-400 hover:text-white transition"
+            aria-label="Close cart"
           >
             <X className="w-5 h-5" />
           </button>
@@ -129,7 +141,7 @@ export function CartDrawer() {
 
         {/* Content */}
         <div className="flex-1 overflow-y-auto p-4">
-          {items.length === 0 ? (
+          {displayItems.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-full text-center">
               <ShoppingCart className="w-12 h-12 text-slate-600 mb-4" />
               <h3 className="text-lg font-medium text-white mb-2">
@@ -150,7 +162,7 @@ export function CartDrawer() {
             </div>
           ) : (
             <div className="space-y-3">
-              {items.map((item) => (
+              {displayItems.map((item) => (
                 <CartItemCard key={item.id} item={item} />
               ))}
             </div>
@@ -158,7 +170,7 @@ export function CartDrawer() {
         </div>
 
         {/* Footer */}
-        {items.length > 0 && (
+        {displayItems.length > 0 && (
           <div className="border-t border-slate-800 p-4 space-y-4">
             {/* Summary */}
             <div className="space-y-2">
@@ -172,7 +184,7 @@ export function CartDrawer() {
               </div>
               <div className="flex justify-between font-semibold text-lg border-t border-slate-700 pt-2">
                 <span className="text-white">Total</span>
-                <span className="text-white">{formatCurrency(total)}</span>
+                <span className="text-white">{formatCurrency(total * 1.2)}</span>
               </div>
             </div>
 

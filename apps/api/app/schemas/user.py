@@ -27,7 +27,12 @@ class UserCreate(BaseModel):
     @field_validator('password')
     @classmethod
     def validate_password_strength(cls, v: str) -> str:
-        """Validate password meets security requirements"""
+        """
+        Validate password meets security requirements.
+
+        MEDIUM FIX: Enhanced password validation with special character requirement
+        and more comprehensive weak password list.
+        """
         if len(v) < 8:
             raise ValueError('Password must be at least 8 characters long')
         if not re.search(r'[A-Z]', v):
@@ -36,9 +41,16 @@ class UserCreate(BaseModel):
             raise ValueError('Password must contain at least one lowercase letter')
         if not re.search(r'\d', v):
             raise ValueError('Password must contain at least one digit')
+        # MEDIUM FIX: Require special character for stronger passwords
+        if not re.search(r'[!@#$%^&*(),.?":{}|<>_\-+=\[\]\\\/`~]', v):
+            raise ValueError('Password must contain at least one special character (!@#$%^&*...)')
         # Check for common weak passwords
-        weak_passwords = ['password', '12345678', 'qwerty123', 'admin123', 'letmein1']
-        if v.lower() in weak_passwords:
+        weak_passwords = [
+            'password', '12345678', 'qwerty123', 'admin123', 'letmein1',
+            'welcome1', 'monkey12', 'dragon12', 'master12', 'abc12345',
+            'passw0rd', 'p@ssword', 'p@ssw0rd', 'password1', 'password!',
+        ]
+        if v.lower() in weak_passwords or any(weak in v.lower() for weak in ['password', '123456', 'qwerty']):
             raise ValueError('Password is too common. Please choose a stronger password')
         return v
 
@@ -107,3 +119,59 @@ class ApiKeyCreatedResponse(BaseModel):
 
     api_key: str  # Full key - only shown once
     key_info: ApiKeyResponse
+
+
+class TokenResponse(BaseModel):
+    """Schema for authentication token response"""
+
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_in: int = Field(description="Token expiry in seconds")
+    user: UserResponse
+
+
+class TwoFactorPendingResponse(BaseModel):
+    """Response when 2FA verification is required"""
+
+    requires_2fa: bool = True
+    pending_token: str = Field(description="Token to complete 2FA verification")
+    message: str = "Two-factor authentication required"
+
+
+class RefreshTokenRequest(BaseModel):
+    """Schema for token refresh request"""
+
+    refresh_token: str
+
+
+class RefreshTokenResponse(BaseModel):
+    """Schema for token refresh response"""
+
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_in: int = Field(description="Token expiry in seconds")
+
+
+class DashboardStats(BaseModel):
+    """Schema for dashboard statistics"""
+
+    identities_count: int = 0
+    total_revenue: float = 0.0
+    verification_checks: int = 0
+    active_licenses: int = 0
+    user_tier: str
+
+
+class MessageResponse(BaseModel):
+    """Generic message response"""
+
+    message: str
+
+
+class StatusResponse(BaseModel):
+    """Generic status response"""
+
+    status: str
+    message: str

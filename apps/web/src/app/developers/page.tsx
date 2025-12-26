@@ -15,6 +15,7 @@ import {
   Copy
 } from 'lucide-react'
 import { useState } from 'react'
+import { logger } from '@/lib/logger'
 
 // API documentation URL - configurable via environment variable
 const API_DOCS_URL = process.env.NEXT_PUBLIC_API_URL
@@ -24,10 +25,26 @@ const API_DOCS_URL = process.env.NEXT_PUBLIC_API_URL
 export default function DevelopersPage() {
   const [copied, setCopied] = useState<string | null>(null)
 
-  const copyToClipboard = (text: string, id: string) => {
-    navigator.clipboard.writeText(text)
-    setCopied(id)
-    setTimeout(() => setCopied(null), 2000)
+  const copyToClipboard = async (text: string, id: string) => {
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text)
+      } else {
+        // Fallback for older browsers or non-secure contexts
+        const textArea = document.createElement('textarea')
+        textArea.value = text
+        textArea.style.position = 'fixed'
+        textArea.style.left = '-999999px'
+        document.body.appendChild(textArea)
+        textArea.select()
+        document.execCommand('copy')
+        document.body.removeChild(textArea)
+      }
+      setCopied(id)
+      setTimeout(() => setCopied(null), 2000)
+    } catch (err) {
+      logger.error('Failed to copy text', err as Error)
+    }
   }
 
   const codeExamples = {
@@ -103,7 +120,7 @@ if (result.matched) {
     { method: 'GET', path: '/v1/identity/{id}', description: 'Get identity details and permissions' },
     { method: 'POST', path: '/v1/license/check', description: 'Check if usage is licensed' },
     { method: 'GET', path: '/v1/marketplace/listings', description: 'Browse available Actor Packs' },
-    { method: 'POST', path: '/v1/actor-pack/generate', description: 'Generate content with Actor Pack' },
+    { method: 'POST', path: '/v1/actor-packs/train', description: 'Train a new Actor Pack' },
   ]
 
   return (
@@ -122,7 +139,7 @@ if (result.matched) {
             <Link href="/developers" className="text-purple-400">
               Developers
             </Link>
-            <Link href={API_DOCS_URL} target="_blank">
+            <Link href={API_DOCS_URL} target="_blank" rel="noopener noreferrer">
               <Button variant="outline" className="border-gray-700 text-gray-300">
                 API Docs
               </Button>
@@ -145,7 +162,7 @@ if (result.matched) {
             Integrate identity verification and AI licensing into your platform with our powerful API
           </p>
           <div className="flex justify-center space-x-4">
-            <Link href={API_DOCS_URL} target="_blank">
+            <Link href={API_DOCS_URL} target="_blank" rel="noopener noreferrer">
               <Button size="lg" className="bg-purple-600 hover:bg-purple-700">
                 <Book className="w-5 h-5 mr-2" />
                 View API Docs
@@ -195,6 +212,7 @@ if (result.matched) {
                     size="sm"
                     onClick={() => copyToClipboard(codeExamples.python, 'python')}
                     className="text-gray-400 hover:text-white"
+                    aria-label={copied === 'python' ? 'Copied Python code' : 'Copy Python code'}
                   >
                     {copied === 'python' ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
                   </Button>
@@ -215,6 +233,7 @@ if (result.matched) {
                     size="sm"
                     onClick={() => copyToClipboard(codeExamples.javascript, 'javascript')}
                     className="text-gray-400 hover:text-white"
+                    aria-label={copied === 'javascript' ? 'Copied JavaScript code' : 'Copy JavaScript code'}
                   >
                     {copied === 'javascript' ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
                   </Button>
@@ -266,7 +285,7 @@ if (result.matched) {
             </Card>
 
             <div className="text-center mt-8">
-              <Link href={API_DOCS_URL} target="_blank">
+              <Link href={API_DOCS_URL} target="_blank" rel="noopener noreferrer">
                 <Button className="bg-purple-600 hover:bg-purple-700">
                   View Full API Documentation
                   <ArrowRight className="w-4 h-4 ml-2" />

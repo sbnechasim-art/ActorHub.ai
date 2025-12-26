@@ -10,6 +10,7 @@ from datetime import datetime
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     Enum,
@@ -24,6 +25,11 @@ from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
+
+# Valid status values for constraints
+IDENTITY_STATUS_VALUES = ('PENDING', 'PROCESSING', 'VERIFIED', 'REJECTED', 'SUSPENDED')
+TRAINING_STATUS_VALUES = ('PENDING', 'QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED')
+PROTECTION_LEVEL_VALUES = ('FREE', 'PRO', 'ENTERPRISE')
 
 
 class ProtectionLevel(str, enum.Enum):
@@ -64,8 +70,13 @@ class Identity(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
 
-    # Owner info
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
+    # Owner info - CASCADE on user delete
+    user_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
 
     # Identity data
     display_name = Column(String(255), nullable=False)
@@ -77,17 +88,18 @@ class Identity(Base):
     face_embedding = Column(Vector(512))
     face_embedding_backup = Column(Vector(512))  # From different angle
 
-    # Status & verification
-    status = Column(Enum(IdentityStatus), default=IdentityStatus.PENDING, index=True)
+    # Status & verification (String to match VARCHAR in DB)
+    status = Column(String(20), default="PENDING", index=True)
     verified_at = Column(DateTime)
     verification_method = Column(String(50))  # "selfie", "id_document", "video"
     verification_data = Column(JSONB)  # Additional verification info
 
-    # Protection settings
-    protection_level = Column(Enum(ProtectionLevel), default=ProtectionLevel.FREE)
+    # Protection settings (String to match VARCHAR in DB)
+    protection_level = Column(String(20), default="FREE")
     allow_commercial_use = Column(Boolean, default=False)
     allow_ai_training = Column(Boolean, default=False)
     allow_deepfake = Column(Boolean, default=False)
+    show_in_public_gallery = Column(Boolean, default=False)
 
     # Restrictions
     blocked_categories = Column(ARRAY(String), default=list)  # ["adult", "political", "gambling"]
@@ -117,17 +129,59 @@ class Identity(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     deleted_at = Column(DateTime)  # Soft delete
 
-    # Relationships
+    # Relationships with proper cascade behavior
     user = relationship("User", back_populates="identities")
-    actor_pack = relationship("ActorPack", back_populates="identity", uselist=False)
+    actor_pack = relationship(
+        "ActorPack",
+        back_populates="identity",
+        uselist=False,
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
     licenses = relationship("License", back_populates="identity", lazy="dynamic")
     usage_logs = relationship("UsageLog", back_populates="identity", lazy="dynamic")
-    listings = relationship("Listing", back_populates="identity", lazy="dynamic")
+    listings = relationship(
+        "Listing",
+        back_populates="identity",
+        lazy="dynamic",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
-    # Indexes
+    # Indexes and constraints
     __table_args__ = (
+        # Status value constraints
+        CheckConstraint(
+            "status IN ('PENDING', 'PROCESSING', 'VERIFIED', 'REJECTED', 'SUSPENDED')",
+            name="chk_identity_status",
+        ),
+        CheckConstraint(
+            "protection_level IN ('FREE', 'PRO', 'ENTERPRISE')",
+            name="chk_identity_protection_level",
+        ),
+        # Pricing constraints
+        CheckConstraint("base_license_fee >= 0", name="chk_identity_base_fee_positive"),
+        CheckConstraint("hourly_rate >= 0", name="chk_identity_hourly_rate_positive"),
+        CheckConstraint("per_image_rate >= 0", name="chk_identity_per_image_rate_positive"),
+        CheckConstraint(
+            "revenue_share_percent >= 0 AND revenue_share_percent <= 100",
+            name="chk_identity_revenue_share_range",
+        ),
+        # Stats constraints
+        CheckConstraint("total_verifications >= 0", name="chk_identity_total_verifications_positive"),
+        CheckConstraint("total_licenses >= 0", name="chk_identity_total_licenses_positive"),
+        CheckConstraint("total_revenue >= 0", name="chk_identity_total_revenue_positive"),
+        # Indexes
         Index("idx_identity_user_status", "user_id", "status"),
         Index("idx_identity_commercial", "allow_commercial_use", "status"),
+        Index(
+            "idx_identity_user_display_name_unique",
+            "user_id",
+            "display_name",
+            unique=True,
+            postgresql_where="deleted_at IS NULL",
+        ),
+        Index("idx_identity_not_deleted", "id", postgresql_where="deleted_at IS NULL"),
     )
 
 
@@ -140,7 +194,13 @@ class ActorPack(Base):
     __tablename__ = "actor_packs"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    identity_id = Column(UUID(as_uuid=True), ForeignKey("identities.id"), unique=True, index=True)
+    identity_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("identities.id", ondelete="CASCADE"),
+        unique=True,
+        nullable=False,
+        index=True,
+    )
 
     # Pack info
     name = Column(String(255), nullable=False)
@@ -148,8 +208,8 @@ class ActorPack(Base):
     version = Column(String(20), default="1.0.0")
     slug = Column(String(100), unique=True)  # For URL
 
-    # Training status
-    training_status = Column(Enum(TrainingStatus), default=TrainingStatus.PENDING)
+    # Training status (String to match VARCHAR in DB)
+    training_status = Column(String(20), default="PENDING")
     training_started_at = Column(DateTime)
     training_completed_at = Column(DateTime)
     training_error = Column(Text)
@@ -218,6 +278,58 @@ class ActorPack(Base):
     # Relationships
     identity = relationship("Identity", back_populates="actor_pack")
 
+    # Constraints and Indexes
+    __table_args__ = (
+        # Status constraint
+        CheckConstraint(
+            "training_status IN ('PENDING', 'QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED')",
+            name="chk_actor_pack_training_status",
+        ),
+        # Progress range
+        CheckConstraint(
+            "training_progress >= 0 AND training_progress <= 100",
+            name="chk_actor_pack_progress_range",
+        ),
+        # Quality score ranges
+        CheckConstraint(
+            "quality_score IS NULL OR (quality_score >= 0 AND quality_score <= 100)",
+            name="chk_actor_pack_quality_range",
+        ),
+        CheckConstraint(
+            "authenticity_score IS NULL OR (authenticity_score >= 0 AND authenticity_score <= 100)",
+            name="chk_actor_pack_authenticity_range",
+        ),
+        CheckConstraint(
+            "consistency_score IS NULL OR (consistency_score >= 0 AND consistency_score <= 100)",
+            name="chk_actor_pack_consistency_range",
+        ),
+        CheckConstraint(
+            "voice_quality_score IS NULL OR (voice_quality_score >= 0 AND voice_quality_score <= 100)",
+            name="chk_actor_pack_voice_quality_range",
+        ),
+        # Pricing constraints
+        CheckConstraint("base_price_usd >= 0", name="chk_actor_pack_base_price_positive"),
+        CheckConstraint("price_per_second_usd >= 0", name="chk_actor_pack_price_per_second_positive"),
+        CheckConstraint("price_per_image_usd >= 0", name="chk_actor_pack_price_per_image_positive"),
+        # Stats constraints
+        CheckConstraint("total_downloads >= 0", name="chk_actor_pack_downloads_positive"),
+        CheckConstraint("total_uses >= 0", name="chk_actor_pack_uses_positive"),
+        CheckConstraint("total_revenue_usd >= 0", name="chk_actor_pack_revenue_positive"),
+        CheckConstraint("rating_count >= 0", name="chk_actor_pack_rating_count_positive"),
+        CheckConstraint(
+            "file_size_bytes IS NULL OR file_size_bytes >= 0",
+            name="chk_actor_pack_file_size_positive",
+        ),
+        # Indexes for common queries
+        Index("idx_actor_pack_status", "training_status"),
+        Index("idx_actor_pack_available_public", "is_available", "is_public"),
+        Index(
+            "idx_actor_pack_completed_available",
+            "identity_id",
+            postgresql_where="training_status = 'COMPLETED' AND is_available = true",
+        ),
+    )
+
 
 class UsageLog(Base):
     """
@@ -229,16 +341,30 @@ class UsageLog(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
 
-    # What was checked/used
-    identity_id = Column(UUID(as_uuid=True), ForeignKey("identities.id"), index=True)
-    license_id = Column(UUID(as_uuid=True), ForeignKey("licenses.id"), index=True)
-    actor_pack_id = Column(UUID(as_uuid=True), ForeignKey("actor_packs.id"))
+    # What was checked/used - SET NULL on delete to preserve history
+    identity_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("identities.id", ondelete="SET NULL"),
+        index=True,
+    )
+    license_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("licenses.id", ondelete="SET NULL"),
+        index=True,
+    )
+    actor_pack_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("actor_packs.id", ondelete="SET NULL"),
+    )
 
     # Who
     requester_id = Column(UUID(as_uuid=True), index=True)  # User or API key owner
     requester_type = Column(String(50))  # "platform", "user", "api"
     requester_name = Column(String(255))
-    api_key_id = Column(UUID(as_uuid=True), ForeignKey("api_keys.id"))
+    api_key_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("api_keys.id", ondelete="SET NULL"),
+    )
 
     # What
     action = Column(String(50), nullable=False, index=True)  # "verify", "generate", "download"
@@ -277,8 +403,21 @@ class UsageLog(Base):
     api_key = relationship("ApiKey", backref="usage_logs")
     license = relationship("License", backref="usage_logs")
 
-    # Indexes for analytics
+    # Indexes and constraints
     __table_args__ = (
+        # Validation constraints
+        CheckConstraint(
+            "response_time_ms IS NULL OR response_time_ms >= 0",
+            name="chk_usage_log_response_time_positive",
+        ),
+        CheckConstraint(
+            "similarity_score IS NULL OR (similarity_score >= 0 AND similarity_score <= 1)",
+            name="chk_usage_log_similarity_range",
+        ),
+        CheckConstraint("credits_used >= 0", name="chk_usage_log_credits_positive"),
+        CheckConstraint("amount_charged_usd >= 0", name="chk_usage_log_amount_positive"),
+        CheckConstraint("faces_detected IS NULL OR faces_detected >= 0", name="chk_usage_log_faces_positive"),
+        # Indexes for analytics
         Index("idx_usage_identity_date", "identity_id", "created_at"),
         Index("idx_usage_action_date", "action", "created_at"),
         Index("idx_usage_requester", "requester_id", "created_at"),

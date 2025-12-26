@@ -1,5 +1,6 @@
 'use client'
 
+import { useEffect, useState } from 'react'
 import { ShoppingCart } from 'lucide-react'
 import { useCartStore } from '@/store/cart'
 import { cn } from '@/lib/utils'
@@ -10,7 +11,14 @@ interface CartButtonProps {
 
 export function CartButton({ className }: CartButtonProps) {
   const { openCart, getItemCount } = useCartStore()
-  const itemCount = getItemCount()
+  const [mounted, setMounted] = useState(false)
+
+  useEffect(() => {
+    setMounted(true)
+  }, [])
+
+  // Prevent hydration mismatch - show 0 until client mounts
+  const itemCount = mounted ? getItemCount() : 0
 
   return (
     <button

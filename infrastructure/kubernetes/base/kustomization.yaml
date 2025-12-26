@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: actorhub
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - secrets.yaml
+  - api-deployment.yaml
+  - web-deployment.yaml
+  - worker-deployment.yaml
+  - ingress.yaml
+
+commonLabels:
+  app.kubernetes.io/part-of: actorhub
+  app.kubernetes.io/managed-by: kustomize

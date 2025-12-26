@@ -17,6 +17,9 @@ import {
   Eye,
   ArrowLeft,
   RefreshCw,
+  Sparkles,
+  Play,
+  Loader2,
 } from 'lucide-react'
 import {
   LineChart,
@@ -30,8 +33,10 @@ import {
 
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
-import { identityApi, analyticsApi, actorPackApi, Identity, ActorPack } from '@/lib/api'
-import { useState } from 'react'
+import { identityApi, analyticsApi, actorPackApi, Identity, ActorPack, ActorPackDownload } from '@/lib/api'
+import { useState, useEffect } from 'react'
+import { toast } from '@/hooks/useToast'
+import { getUserFriendlyError } from '@/lib/errors'
 
 // Status configuration
 const STATUS_CONFIG = {
@@ -151,10 +156,23 @@ export default function IdentityDetailPage() {
 
   // Delete mutation
   const deleteMutation = useMutation({
-    mutationFn: () => identityApi.update(identityId, { deleted_at: new Date().toISOString() }),
+    mutationFn: () => identityApi.delete(identityId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['identities'] })
       router.push('/dashboard')
+    },
+  })
+
+  // Cancel training mutation
+  const cancelTrainingMutation = useMutation({
+    mutationFn: (packId: string) => actorPackApi.cancelTraining(packId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['identity', identityId] })
+      toast.success('Training cancelled')
+    },
+    onError: (error: unknown) => {
+      const { title, message } = getUserFriendlyError(error)
+      toast.error(title, message)
     },
   })
 
@@ -169,6 +187,49 @@ export default function IdentityDetailPage() {
       queryClient.invalidateQueries({ queryKey: ['identity', identityId] })
     },
   })
+
+  // Download Actor Pack mutation
+  const downloadMutation = useMutation({
+    mutationFn: () => actorPackApi.downloadOwn(identityId),
+    onSuccess: (data: ActorPackDownload) => {
+      // Open the download URL in a new tab to trigger download
+      const link = document.createElement('a')
+      link.href = data.download_url
+      link.download = `actor-pack-${identityId}.zip`
+      link.target = '_blank'
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+
+      toast.success('Download started!', {
+        description: `Actor Pack v${data.version} (${data.file_size_mb.toFixed(1)} MB)`,
+      })
+    },
+    onError: (error: unknown) => {
+      const { title, message } = getUserFriendlyError(error)
+      toast.error(title, message)
+    },
+  })
+
+  // Poll Replicate for training progress when training is in progress
+  useEffect(() => {
+    const actorPack = identity?.actor_pack as ActorPack | undefined
+    if (!actorPack || actorPack.training_status !== 'PROCESSING') {
+      return
+    }
+
+    const pollInterval = setInterval(async () => {
+      try {
+        await actorPackApi.pollTraining(actorPack.id)
+        // Refetch identity to get updated actor pack
+        queryClient.invalidateQueries({ queryKey: ['identity', identityId] })
+      } catch (error) {
+        console.error('Failed to poll training status:', error)
+      }
+    }, 15000) // Poll every 15 seconds
+
+    return () => clearInterval(pollInterval)
+  }, [identity?.actor_pack, identityId, queryClient])
 
   if (identityLoading) {
     return (
@@ -241,11 +302,12 @@ export default function IdentityDetailPage() {
             </Button>
           </Link>
           <Button
-            variant="destructive"
+            variant="outline"
+            className="border-orange-500 text-orange-500 hover:bg-orange-500/10"
             onClick={() => setShowDeleteConfirm(true)}
           >
             <Trash2 className="w-4 h-4 mr-2" />
-            Delete
+            Deactivate
           </Button>
         </div>
       </div>
@@ -328,6 +390,33 @@ export default function IdentityDetailPage() {
         </Card>
       </div>
 
+      {/* Start Training CTA - Show when no actor pack exists */}
+      {!actorPack && identity.status === 'VERIFIED' && (
+        <Card className="bg-gradient-to-br from-blue-600/20 to-purple-600/20 border-blue-500/30">
+          <CardContent className="p-6">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-4">
+                <div className="w-12 h-12 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center">
+                  <Sparkles className="w-6 h-6 text-white" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-semibold text-white">Create Actor Pack</h3>
+                  <p className="text-slate-400 text-sm">
+                    Train an AI model with your face and voice to generate content
+                  </p>
+                </div>
+              </div>
+              <Link href={`/identity/${identityId}/train`}>
+                <Button className="bg-gradient-to-r from-blue-500 to-purple-600 hover:from-blue-600 hover:to-purple-700">
+                  <Play className="w-4 h-4 mr-2" />
+                  Start Training
+                </Button>
+              </Link>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
       {/* Training Status */}
       {actorPack && (
         <Card className="bg-slate-800 border-slate-700">
@@ -360,20 +449,97 @@ export default function IdentityDetailPage() {
                   style={{ width: `${actorPack.training_progress}%` }}
                 />
               </div>
+
+              {/* Cancel Training Button */}
+              {(actorPack.training_status === 'PROCESSING' || actorPack.training_status === 'QUEUED') && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => cancelTrainingMutation.mutate(actorPack.id)}
+                  disabled={cancelTrainingMutation.isPending}
+                  className="border-red-500/50 text-red-400 hover:bg-red-500/10 hover:text-red-300"
+                >
+                  {cancelTrainingMutation.isPending ? (
+                    <>
+                      <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                      Cancelling...
+                    </>
+                  ) : (
+                    <>
+                      <XCircle className="w-4 h-4 mr-2" />
+                      Cancel Training
+                    </>
+                  )}
+                </Button>
+              )}
             </div>
 
-            {/* Training Details */}
+            {/* Components - What's included */}
+            {actorPack.components && (
+              <div className="flex gap-3 pt-4 border-t border-slate-700">
+                <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-sm ${
+                  actorPack.components.face ? 'bg-green-500/20 text-green-400' : 'bg-slate-700 text-gray-500'
+                }`}>
+                  <span>{actorPack.components.face ? '✓' : '○'}</span>
+                  <span>Face Model</span>
+                </div>
+                <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-sm ${
+                  actorPack.components.voice ? 'bg-purple-500/20 text-purple-400' : 'bg-slate-700 text-gray-500'
+                }`}>
+                  <span>{actorPack.components.voice ? '✓' : '○'}</span>
+                  <span>Voice Clone</span>
+                </div>
+                <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-sm ${
+                  actorPack.components.motion ? 'bg-blue-500/20 text-blue-400' : 'bg-slate-700 text-gray-500'
+                }`}>
+                  <span>{actorPack.components.motion ? '✓' : '○'}</span>
+                  <span>Motion</span>
+                </div>
+              </div>
+            )}
+
+            {/* Quality Scores */}
+            {actorPack.training_status === 'COMPLETED' && (
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4 pt-4 border-t border-slate-700">
+                <div className="text-center p-3 bg-slate-700/50 rounded-lg">
+                  <p className="text-2xl font-bold text-white">
+                    {actorPack.quality_score?.toFixed(0) || '—'}
+                  </p>
+                  <p className="text-gray-400 text-xs mt-1">Overall Quality</p>
+                </div>
+                <div className="text-center p-3 bg-slate-700/50 rounded-lg">
+                  <p className="text-2xl font-bold text-green-400">
+                    {actorPack.authenticity_score?.toFixed(0) || '—'}
+                  </p>
+                  <p className="text-gray-400 text-xs mt-1">Authenticity</p>
+                </div>
+                <div className="text-center p-3 bg-slate-700/50 rounded-lg">
+                  <p className="text-2xl font-bold text-blue-400">
+                    {actorPack.consistency_score?.toFixed(0) || '—'}
+                  </p>
+                  <p className="text-gray-400 text-xs mt-1">Consistency</p>
+                </div>
+                <div className="text-center p-3 bg-slate-700/50 rounded-lg">
+                  <p className="text-2xl font-bold text-purple-400">
+                    {actorPack.voice_quality_score?.toFixed(0) || '—'}
+                  </p>
+                  <p className="text-gray-400 text-xs mt-1">Voice Quality</p>
+                </div>
+              </div>
+            )}
+
+            {/* Training Info */}
             <div className="grid grid-cols-3 gap-4 pt-4 border-t border-slate-700">
               <div>
-                <p className="text-gray-400 text-sm">Authenticity</p>
+                <p className="text-gray-400 text-sm">Images Used</p>
                 <p className="text-white font-semibold">
-                  {actorPack.authenticity_score?.toFixed(0) || 'N/A'}
+                  {actorPack.training_images_count || '—'}
                 </p>
               </div>
               <div>
-                <p className="text-gray-400 text-sm">Consistency</p>
+                <p className="text-gray-400 text-sm">Version</p>
                 <p className="text-white font-semibold">
-                  {actorPack.consistency_score?.toFixed(0) || 'N/A'}
+                  {actorPack.version || '1.0.0'}
                 </p>
               </div>
               <div>
@@ -409,17 +575,30 @@ export default function IdentityDetailPage() {
               </div>
             )}
 
-            {/* Download Button */}
+            {/* Download & Retrain Buttons */}
             {actorPack.training_status === 'COMPLETED' && actorPack.is_available && (
-              <div className="pt-4">
+              <div className="pt-4 space-y-3">
                 <Button
-                  variant="gradient"
-                  className="w-full"
-                  onClick={() => actorPackApi.download(identityId)}
+                  className="w-full bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-600 hover:to-emerald-700"
+                  onClick={() => downloadMutation.mutate()}
+                  disabled={downloadMutation.isPending}
                 >
-                  <Download className="w-4 h-4 mr-2" />
-                  Download Actor Pack
+                  {downloadMutation.isPending ? (
+                    <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
+                  ) : (
+                    <Download className="w-4 h-4 mr-2" />
+                  )}
+                  {downloadMutation.isPending ? 'Preparing Download...' : 'Download Actor Pack'}
                 </Button>
+                <Link href={`/identity/${identityId}/train?retrain=true`} className="block">
+                  <Button
+                    variant="outline"
+                    className="w-full border-blue-500 text-blue-400 hover:bg-blue-500/10"
+                  >
+                    <RefreshCw className="w-4 h-4 mr-2" />
+                    Retrain Actor Pack
+                  </Button>
+                </Link>
               </div>
             )}
           </CardContent>
@@ -480,14 +659,18 @@ export default function IdentityDetailPage() {
           <Card className="bg-slate-800 border-slate-700 max-w-md w-full mx-4">
             <CardHeader>
               <CardTitle className="text-white flex items-center">
-                <AlertCircle className="w-5 h-5 text-red-500 mr-2" />
-                Delete Identity
+                <AlertCircle className="w-5 h-5 text-orange-500 mr-2" />
+                Deactivate Identity
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
               <p className="text-gray-400">
-                Are you sure you want to delete this identity? This action cannot be undone.
-                All associated data, licenses, and training will be permanently removed.
+                Are you sure you want to deactivate this identity?
+                The identity will be hidden and you won't be able to use it.
+                You can register a new identity with the same name later.
+              </p>
+              <p className="text-gray-500 text-sm">
+                Note: Associated licenses will remain valid until expiration.
               </p>
               <div className="flex space-x-3">
                 <Button
@@ -503,7 +686,7 @@ export default function IdentityDetailPage() {
                   onClick={() => deleteMutation.mutate()}
                   loading={deleteMutation.isPending}
                 >
-                  Delete Forever
+                  Deactivate
                 </Button>
               </div>
             </CardContent>

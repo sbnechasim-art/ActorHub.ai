@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: actorhub-config
+  namespace: actorhub
+data:
+  # Application
+  APP_NAME: "ActorHub.ai"
+  ENVIRONMENT: "production"
+
+  # URLs
+  FRONTEND_URL: "https://actorhub.ai"
+  API_URL: "https://api.actorhub.ai"
+
+  # Feature Flags
+  ENABLE_BLOCKCHAIN: "false"
+  ENABLE_ACTOR_PACKS: "true"
+  ENABLE_MARKETPLACE: "true"
+  ENABLE_VOICE_CLONING: "true"
+
+  # Qdrant
+  QDRANT_HOST: "qdrant"
+  QDRANT_PORT: "6333"
+  QDRANT_COLLECTION: "face_embeddings"
+
+  # Payout Settings
+  PAYOUT_HOLDING_DAYS: "7"
+  PAYOUT_MINIMUM_USD: "50"
+  PAYOUT_PLATFORM_FEE_PERCENT: "20"
+
+  # Rate Limiting
+  RATE_LIMIT_REQUESTS: "100"
+  RATE_LIMIT_WINDOW: "60"

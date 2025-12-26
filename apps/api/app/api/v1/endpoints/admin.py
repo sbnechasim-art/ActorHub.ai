@@ -9,74 +9,36 @@ from uuid import UUID
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
 from sqlalchemy import select, func, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.license import escape_like_pattern
+from app.core.helpers import utc_now  # MEDIUM FIX: Use timezone-aware datetime
+
 from app.core.database import get_db
-from app.core.security import get_current_user
+from app.core.security import (
+    get_current_user,
+    require_admin,
+    require_permission,
+    AdminPermission,
+)
 from app.models.identity import Identity, ActorPack, UsageLog
 from app.models.marketplace import License, Transaction
-from app.models.notifications import AuditLog, WebhookEvent, Subscription, Payout
+from app.models.notifications import AuditLog, WebhookEvent, Subscription, Payout, SubscriptionStatus
 from app.models.user import User, UserRole, UserTier
+from app.schemas.admin import (
+    AdminDashboardStats,
+    UserSummary,
+    AuditLogEntry,
+    UserListResponse,
+    AuditLogListResponse,
+)
 
 logger = structlog.get_logger()
 router = APIRouter()
 
 
-async def require_admin(current_user: User = Depends(get_current_user)) -> User:
-    """Dependency that requires admin role"""
-    if current_user.role != UserRole.ADMIN:
-        logger.warning(
-            f"Admin access denied for user {current_user.id}",
-            user_id=str(current_user.id),
-            role=current_user.role.value if current_user.role else "None",
-        )
-        raise HTTPException(
-            status_code=403,
-            detail="Admin access required",
-        )
-    return current_user
-
-
-class DashboardStats(BaseModel):
-    """Dashboard statistics"""
-    total_users: int
-    active_users: int
-    total_identities: int
-    total_actor_packs: int
-    total_revenue: float
-    revenue_this_month: float
-    api_calls_today: int
-    active_subscriptions: int
-
-
-class UserSummary(BaseModel):
-    """User summary for admin list"""
-    id: UUID
-    email: str
-    display_name: Optional[str]
-    role: str
-    tier: str
-    is_active: bool
-    created_at: datetime
-    last_login_at: Optional[datetime]
-
-
-class AuditLogEntry(BaseModel):
-    """Audit log entry"""
-    id: UUID
-    user_email: Optional[str]
-    action: str
-    resource_type: str
-    resource_id: Optional[UUID]
-    description: Optional[str]
-    ip_address: Optional[str]
-    success: bool
-    created_at: datetime
-
-
-@router.get("/dashboard", response_model=DashboardStats)
+@router.get("/dashboard", response_model=AdminDashboardStats)
 async def get_dashboard_stats(
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
@@ -86,7 +48,7 @@ async def get_dashboard_stats(
     total_users = await db.scalar(select(func.count()).select_from(User)) or 0
 
     # Active users (logged in last 30 days)
-    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+    thirty_days_ago = utc_now() - timedelta(days=30)
     active_users = await db.scalar(
         select(func.count()).where(
             User.last_login_at >= thirty_days_ago,
@@ -110,7 +72,7 @@ async def get_dashboard_stats(
     ) or 0.0
 
     # Revenue this month
-    month_start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    month_start = utc_now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     revenue_this_month = await db.scalar(
         select(func.sum(Transaction.amount_usd)).where(
             Transaction.type == "PURCHASE",
@@ -119,17 +81,17 @@ async def get_dashboard_stats(
     ) or 0.0
 
     # API calls today
-    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start = utc_now().replace(hour=0, minute=0, second=0, microsecond=0)
     api_calls_today = await db.scalar(
         select(func.count()).where(UsageLog.created_at >= today_start)
     ) or 0
 
     # Active subscriptions
     active_subscriptions = await db.scalar(
-        select(func.count()).where(Subscription.status == "ACTIVE")
+        select(func.count()).where(Subscription.status == SubscriptionStatus.ACTIVE)
     ) or 0
 
-    return DashboardStats(
+    return AdminDashboardStats(
         total_users=total_users,
         active_users=active_users,
         total_identities=total_identities,
@@ -141,7 +103,7 @@ async def get_dashboard_stats(
     )
 
 
-@router.get("/users")
+@router.get("/users", response_model=UserListResponse)
 async def list_users(
     role: Optional[UserRole] = None,
     tier: Optional[UserTier] = None,
@@ -162,13 +124,28 @@ async def list_users(
     if is_active is not None:
         query = query.where(User.is_active == is_active)
     if search:
+        # SECURITY FIX: Escape LIKE pattern special characters
+        safe_search = escape_like_pattern(search)
         query = query.where(
-            User.email.ilike(f"%{search}%") |
-            User.display_name.ilike(f"%{search}%")
+            User.email.ilike(f"%{safe_search}%", escape="\\") |
+            User.display_name.ilike(f"%{safe_search}%", escape="\\")
         )
 
-    # Count total
-    count_query = select(func.count()).select_from(query.subquery())
+    # HIGH FIX: Optimized count query - count directly instead of subquery
+    # Build count query with same filters but without subquery overhead
+    count_query = select(func.count(User.id))
+    if role:
+        count_query = count_query.where(User.role == role)
+    if tier:
+        count_query = count_query.where(User.tier == tier)
+    if is_active is not None:
+        count_query = count_query.where(User.is_active == is_active)
+    if search:
+        safe_search = escape_like_pattern(search)
+        count_query = count_query.where(
+            User.email.ilike(f"%{safe_search}%", escape="\\") |
+            User.display_name.ilike(f"%{safe_search}%", escape="\\")
+        )
     total = await db.scalar(count_query) or 0
 
     # Apply pagination
@@ -176,24 +153,24 @@ async def list_users(
     result = await db.execute(query)
     users = result.scalars().all()
 
-    return {
-        "users": [
+    return UserListResponse(
+        users=[
             UserSummary(
                 id=u.id,
                 email=u.email,
                 display_name=u.display_name,
-                role=u.role.value if u.role else "USER",
-                tier=u.tier.value if u.tier else "FREE",
+                role=u.role.value if hasattr(u.role, 'value') else (u.role or "USER"),
+                tier=u.tier.value if hasattr(u.tier, 'value') else (u.tier or "FREE"),
                 is_active=u.is_active or False,
                 created_at=u.created_at,
                 last_login_at=u.last_login_at,
             )
             for u in users
         ],
-        "total": total,
-        "limit": limit,
-        "offset": offset,
-    }
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get("/users/{user_id}")
@@ -249,22 +226,23 @@ async def update_user(
     role: Optional[UserRole] = None,
     tier: Optional[UserTier] = None,
     is_active: Optional[bool] = None,
-    admin: User = Depends(require_admin),
+    # SECURITY FIX: Granular permission for user management
+    admin: User = Depends(require_permission(AdminPermission.MANAGE_USERS)),
     db: AsyncSession = Depends(get_db),
 ):
-    """Update user (admin only)"""
+    """Update user (requires MANAGE_USERS permission)"""
     user = await db.get(User, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
     # Prevent self-demotion
-    if user.id == admin.id and role and role != UserRole.ADMIN:
+    if user.id == admin.id and role and role.value != "ADMIN":
         raise HTTPException(status_code=400, detail="Cannot demote yourself")
 
     if role is not None:
-        user.role = role
+        user.role = role.value  # Store as string
     if tier is not None:
-        user.tier = tier
+        user.tier = tier.value  # Store as string
     if is_active is not None:
         user.is_active = is_active
 
@@ -280,7 +258,7 @@ async def update_user(
     return {"status": "success", "message": "User updated"}
 
 
-@router.get("/audit-logs")
+@router.get("/audit-logs", response_model=AuditLogListResponse)
 async def get_audit_logs(
     user_id: Optional[UUID] = None,
     action: Optional[str] = None,
@@ -312,10 +290,11 @@ async def get_audit_logs(
     result = await db.execute(query)
     rows = result.all()
 
-    return {
-        "logs": [
+    return AuditLogListResponse(
+        logs=[
             AuditLogEntry(
                 id=log.id,
+                user_id=log.user_id,
                 user_email=user.email if user else None,
                 action=log.action.value if log.action else "UNKNOWN",
                 resource_type=log.resource_type,
@@ -327,10 +306,10 @@ async def get_audit_logs(
             )
             for log, user in rows
         ],
-        "total": total,
-        "limit": limit,
-        "offset": offset,
-    }
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get("/webhooks")
@@ -431,10 +410,11 @@ async def get_pending_payouts(
 @router.post("/payouts/{payout_id}/approve")
 async def approve_payout(
     payout_id: UUID,
-    admin: User = Depends(require_admin),
+    # SECURITY FIX: Granular permission for financial operations
+    admin: User = Depends(require_permission(AdminPermission.PROCESS_PAYOUTS)),
     db: AsyncSession = Depends(get_db),
 ):
-    """Approve and process a payout via Stripe Connect"""
+    """Approve and process a payout via Stripe Connect (requires PROCESS_PAYOUTS permission)"""
     import stripe
     from app.core.config import settings
     from app.models.notifications import PayoutStatus
@@ -466,7 +446,7 @@ async def approve_payout(
 
     # Mark as processing before API call
     payout.status = PayoutStatus.PROCESSING
-    payout.processed_at = datetime.utcnow()
+    payout.processed_at = utc_now()
     await db.commit()
 
     try:
@@ -489,7 +469,7 @@ async def approve_payout(
         # Update payout with Stripe transfer ID
         payout.stripe_transfer_id = transfer.id
         payout.status = PayoutStatus.COMPLETED
-        payout.completed_at = datetime.utcnow()
+        payout.completed_at = utc_now()
         await db.commit()
 
         logger.info(
@@ -518,7 +498,10 @@ async def approve_payout(
             error=str(e),
         )
 
+        # SECURITY: Don't expose internal error details in production
+        from app.core.config import settings
+        error_detail = f"Stripe transfer failed: {str(e)}" if settings.DEBUG else "Stripe transfer failed. Please contact support."
         raise HTTPException(
             status_code=400,
-            detail=f"Stripe transfer failed: {str(e)}"
+            detail=error_detail
         )

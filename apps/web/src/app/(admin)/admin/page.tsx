@@ -2,16 +2,19 @@
 
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useRouter } from 'next/navigation'
+import Link from 'next/link'
 import {
   Users, Shield, AlertTriangle, DollarSign, Activity,
   Eye, Ban, CheckCircle, Search, Webhook, CreditCard,
   Filter, MoreHorizontal, RefreshCw, ChevronLeft, ChevronRight,
-  Clock, XCircle, Loader2, ExternalLink
+  Clock, XCircle, Loader2, ExternalLink, Lock
 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { adminApi, AdminUser, WebhookEvent, AdminPayout } from '@/lib/api'
+import { useAuth } from '@/hooks/useAuth'
 
 function StatCard({ title, value, icon: Icon, trend, color, loading }: {
   title: string
@@ -66,44 +69,51 @@ function StatusBadge({ status }: { status: string }) {
 
 export default function AdminDashboard() {
   const queryClient = useQueryClient()
+  const router = useRouter()
+  const { user, isLoading: authLoading, isAuthenticated } = useAuth()
   const [activeTab, setActiveTab] = useState<'overview' | 'users' | 'payouts' | 'webhooks' | 'audit'>('overview')
   const [userSearch, setUserSearch] = useState('')
   const [userPage, setUserPage] = useState(0)
   const [webhookPage, setWebhookPage] = useState(0)
 
-  // Dashboard stats
+  // Check admin access
+  const isAdmin = user?.role === 'ADMIN' || user?.role === 'admin'
+  const hasAccess = isAuthenticated && isAdmin
+
+  // Dashboard stats - only fetch if user has access
   const { data: stats, isLoading: statsLoading, error: statsError } = useQuery({
     queryKey: ['admin-dashboard'],
     queryFn: adminApi.getDashboard,
     retry: 1,
+    enabled: hasAccess,
   })
 
   // Users
   const { data: usersData, isLoading: usersLoading } = useQuery({
     queryKey: ['admin-users', userSearch, userPage],
     queryFn: () => adminApi.getUsers({ search: userSearch || undefined, limit: 20, offset: userPage * 20 }),
-    enabled: activeTab === 'users' || activeTab === 'overview',
+    enabled: hasAccess && (activeTab === 'users' || activeTab === 'overview'),
   })
 
   // Webhooks
   const { data: webhooksData, isLoading: webhooksLoading } = useQuery({
     queryKey: ['admin-webhooks', webhookPage],
     queryFn: () => adminApi.getWebhooks({ limit: 20, offset: webhookPage * 20 }),
-    enabled: activeTab === 'webhooks',
+    enabled: hasAccess && activeTab === 'webhooks',
   })
 
   // Pending Payouts
   const { data: payoutsData, isLoading: payoutsLoading } = useQuery({
     queryKey: ['admin-payouts'],
     queryFn: adminApi.getPendingPayouts,
-    enabled: activeTab === 'payouts' || activeTab === 'overview',
+    enabled: hasAccess && (activeTab === 'payouts' || activeTab === 'overview'),
   })
 
   // Audit Logs
   const { data: auditData, isLoading: auditLoading } = useQuery({
     queryKey: ['admin-audit'],
     queryFn: () => adminApi.getAuditLogs({ limit: 50 }),
-    enabled: activeTab === 'audit',
+    enabled: hasAccess && activeTab === 'audit',
   })
 
   // Mutations
@@ -129,6 +139,35 @@ export default function AdminDashboard() {
       queryClient.invalidateQueries({ queryKey: ['admin-users'] })
     },
   })
+
+  // Show loading while checking auth
+  if (authLoading) {
+    return (
+      <div className="min-h-screen bg-slate-950 flex items-center justify-center">
+        <Loader2 className="w-8 h-8 animate-spin text-purple-500" />
+      </div>
+    )
+  }
+
+  // Show access denied if not authenticated or not admin
+  if (!hasAccess) {
+    return (
+      <div className="min-h-screen bg-slate-950 flex items-center justify-center">
+        <Card className="bg-slate-800/50 border-slate-700 max-w-md">
+          <CardContent className="p-8 text-center">
+            <Lock className="w-12 h-12 text-red-500 mx-auto mb-4" />
+            <h2 className="text-xl font-semibold text-white mb-2">Access Denied</h2>
+            <p className="text-slate-400 mb-6">
+              You don't have permission to access the admin dashboard.
+            </p>
+            <Button asChild variant="outline">
+              <Link href="/dashboard">Go to Dashboard</Link>
+            </Button>
+          </CardContent>
+        </Card>
+      </div>
+    )
+  }
 
   const hasApiError = statsError !== null
 

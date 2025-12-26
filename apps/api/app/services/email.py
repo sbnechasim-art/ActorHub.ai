@@ -8,25 +8,45 @@ Handles all transactional email sending for ActorHub.ai including:
 - License purchase confirmations
 - Payout notifications
 - Password reset
+
+Features:
+- Async execution to avoid blocking
+- Retry logic for transient failures
+- Timeout configuration
+- Graceful degradation when not configured
 """
 
-import structlog
+import asyncio
+import threading
+import time
 from typing import Optional, Dict, Any, List
 from datetime import datetime
+from functools import partial
+
+import structlog
 
 from app.core.config import settings
+from app.core.monitoring import EMAIL_SENT, NOTIFICATION_SENT
 
 logger = structlog.get_logger()
 
+# Configuration
+EMAIL_TIMEOUT = 30  # seconds
+EMAIL_RETRY_ATTEMPTS = 3
+EMAIL_RETRY_DELAY = 2.0  # seconds
+
 
 class EmailService:
-    """SendGrid email service with template support."""
+    """SendGrid email service with template support and resilience."""
 
     def __init__(self):
         self.api_key = settings.SENDGRID_API_KEY
         self.from_email = settings.EMAIL_FROM
         self.from_name = settings.EMAIL_FROM_NAME
         self._client = None
+        self._consecutive_failures = 0
+        self._max_consecutive_failures = 5
+        self._lock = threading.Lock()  # Thread-safe counter updates
 
     @property
     def client(self):
@@ -43,6 +63,26 @@ class EmailService:
                 return None
         return self._client
 
+    @property
+    def is_configured(self) -> bool:
+        """Check if email service is properly configured"""
+        return bool(self.api_key)
+
+    @property
+    def is_healthy(self) -> bool:
+        """Check if service is healthy (not too many consecutive failures)"""
+        return self._consecutive_failures < self._max_consecutive_failures
+
+    def _record_success(self):
+        """Record a successful email send (thread-safe)"""
+        with self._lock:
+            self._consecutive_failures = 0
+
+    def _record_failure(self):
+        """Record a failed email send (thread-safe)"""
+        with self._lock:
+            self._consecutive_failures += 1
+
     async def send_email(
         self,
         to_email: str,
@@ -53,7 +93,7 @@ class EmailService:
         attachments: Optional[List[Dict]] = None,
     ) -> bool:
         """
-        Send an email using SendGrid.
+        Send an email using SendGrid with retry logic.
 
         Args:
             to_email: Recipient email address
@@ -75,6 +115,81 @@ class EmailService:
             )
             return True
 
+        if not self.is_healthy:
+            logger.warning(
+                "Email service degraded, skipping send",
+                consecutive_failures=self._consecutive_failures,
+            )
+            return False
+
+        # Run the actual send in executor with retry
+        loop = asyncio.get_event_loop()
+        last_error = None
+
+        for attempt in range(1, EMAIL_RETRY_ATTEMPTS + 1):
+            try:
+                result = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None,
+                        partial(
+                            self._send_email_sync,
+                            to_email=to_email,
+                            subject=subject,
+                            html_content=html_content,
+                            plain_content=plain_content,
+                            reply_to=reply_to,
+                            attachments=attachments,
+                        )
+                    ),
+                    timeout=EMAIL_TIMEOUT,
+                )
+                if result:
+                    self._record_success()
+                    return True
+                else:
+                    raise Exception("SendGrid returned non-success status")
+
+            except asyncio.TimeoutError:
+                last_error = TimeoutError(f"Email send timed out after {EMAIL_TIMEOUT}s")
+                logger.warning(
+                    f"Email send timeout, attempt {attempt}/{EMAIL_RETRY_ATTEMPTS}",
+                    to=to_email,
+                )
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"Email send failed, attempt {attempt}/{EMAIL_RETRY_ATTEMPTS}",
+                    to=to_email,
+                    error=str(e),
+                )
+
+            if attempt < EMAIL_RETRY_ATTEMPTS:
+                await asyncio.sleep(EMAIL_RETRY_DELAY * attempt)
+
+        # All retries failed - record metrics
+        self._record_failure()
+        EMAIL_SENT.labels(template="generic", status="failed").inc()
+        NOTIFICATION_SENT.labels(type="email", status="failed").inc()
+
+        logger.error(
+            "Failed to send email after all retries",
+            to=to_email,
+            subject=subject,
+            error=str(last_error),
+            attempts=EMAIL_RETRY_ATTEMPTS,
+        )
+        return False
+
+    def _send_email_sync(
+        self,
+        to_email: str,
+        subject: str,
+        html_content: str,
+        plain_content: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        attachments: Optional[List[Dict]] = None,
+    ) -> bool:
+        """Synchronous email sending (called from executor)"""
         try:
             from sendgrid.helpers.mail import (
                 Mail, Email, To, Content, Attachment,
@@ -112,14 +227,19 @@ class EmailService:
 
             response = self.client.send(message)
 
-            logger.info(
-                "Email sent successfully",
-                to=to_email,
-                subject=subject,
-                status_code=response.status_code,
-            )
+            success = response.status_code in (200, 201, 202)
+            if success:
+                # Record success metrics
+                EMAIL_SENT.labels(template="generic", status="success").inc()
+                NOTIFICATION_SENT.labels(type="email", status="success").inc()
 
-            return response.status_code in (200, 201, 202)
+                logger.info(
+                    "Email sent successfully",
+                    to=to_email,
+                    subject=subject,
+                    status_code=response.status_code,
+                )
+            return success
 
         except Exception as e:
             logger.error(
@@ -128,7 +248,7 @@ class EmailService:
                 subject=subject,
                 error=str(e),
             )
-            return False
+            raise
 
     # ==========================================
     # Email Templates

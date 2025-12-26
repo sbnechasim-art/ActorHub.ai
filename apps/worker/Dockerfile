@@ -1,9 +1,10 @@
 # ActorHub Worker - Production Dockerfile
+# SECURITY: Pin Python version to match API (was 3.11-slim, now 3.11.8-slim)
 
 # ============================================
 # Stage 1: Builder
 # ============================================
-FROM python:3.11-slim as builder
+FROM python:3.11.8-slim as builder
 
 WORKDIR /app
 
@@ -25,7 +26,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # ============================================
 # Stage 2: Production
 # ============================================
-FROM python:3.11-slim as production
+FROM python:3.11.8-slim as production
 
 # Security: Run as non-root user
 RUN groupadd -r celery && useradd -r -g celery celery

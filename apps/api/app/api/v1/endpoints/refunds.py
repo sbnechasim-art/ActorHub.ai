@@ -8,44 +8,26 @@ from typing import Optional
 from uuid import UUID
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.helpers import utc_now  # MEDIUM FIX: Use timezone-aware datetime
 from app.core.database import get_db
-from app.core.security import get_current_user
+from app.core.security import (
+    get_current_user,
+    require_admin,
+    require_permission,
+    AdminPermission,
+)
 from app.models.marketplace import License, Transaction
 from app.models.notifications import AuditLog, AuditAction, Notification, NotificationType
 from app.models.user import User, UserRole
+from app.schemas.refund import RefundRequest, RefundResponse, RefundStatusResponse
 
 logger = structlog.get_logger()
 router = APIRouter()
-
-
-class RefundRequest(BaseModel):
-    """Refund request from user"""
-    license_id: UUID
-    reason: str = Field(..., min_length=10, max_length=1000)
-
-
-class RefundResponse(BaseModel):
-    """Refund response"""
-    refund_id: str
-    status: str
-    amount: float
-    currency: str
-    message: str
-
-
-class RefundStatus(BaseModel):
-    """Refund status check"""
-    refund_id: str
-    status: str
-    amount: float
-    created_at: datetime
-    processed_at: Optional[datetime]
 
 
 # Refund policy constants - loaded from config
@@ -54,14 +36,7 @@ MAX_REFUNDS_PER_USER = settings.MAX_REFUNDS_PER_USER
 MIN_PURCHASE_AGE_HOURS = settings.REFUND_COOLING_HOURS  # Prevent immediate refund abuse
 
 
-async def require_admin(current_user: User = Depends(get_current_user)) -> User:
-    """Dependency that requires admin role"""
-    if current_user.role != UserRole.ADMIN:
-        raise HTTPException(status_code=403, detail="Admin access required")
-    return current_user
-
-
-@router.post("/request", response_model=RefundResponse)
+@router.post("/request", response_model=RefundResponse, status_code=status.HTTP_201_CREATED)
 async def request_refund(
     request: RefundRequest,
     current_user: User = Depends(get_current_user),
@@ -74,6 +49,14 @@ async def request_refund(
     - Must be within 14 days of purchase
     - License must not have been used extensively
     - Maximum 3 refunds per user lifetime
+
+    **Returns:** 201 Created with refund details on success.
+
+    **Errors:**
+    - 400: Already refunded, window expired, payment not found, or Stripe error
+    - 401: Unauthorized
+    - 403: Not your license
+    - 404: License not found
     """
     import stripe
     stripe.api_key = settings.STRIPE_SECRET_KEY
@@ -92,14 +75,14 @@ async def request_refund(
 
     # Check refund window
     purchase_date = license.created_at
-    if datetime.utcnow() - purchase_date > timedelta(days=REFUND_WINDOW_DAYS):
+    if utc_now() - purchase_date > timedelta(days=REFUND_WINDOW_DAYS):
         raise HTTPException(
             status_code=400,
             detail=f"Refund window expired. Refunds must be requested within {REFUND_WINDOW_DAYS} days."
         )
 
     # Prevent immediate refund abuse
-    if datetime.utcnow() - purchase_date < timedelta(hours=MIN_PURCHASE_AGE_HOURS):
+    if utc_now() - purchase_date < timedelta(hours=MIN_PURCHASE_AGE_HOURS):
         raise HTTPException(
             status_code=400,
             detail="Please wait at least 1 hour after purchase to request a refund."
@@ -134,7 +117,7 @@ async def request_refund(
         raise HTTPException(status_code=400, detail="No payment to refund")
 
     # Validate refund amount is reasonable
-    MAX_REFUND_AMOUNT = 10000  # $10,000 max refund
+    MAX_REFUND_AMOUNT = settings.MAX_REFUND_AMOUNT_USD  # From config
     if original_transaction.amount_usd > MAX_REFUND_AMOUNT:
         logger.warning(
             "Large refund request requires manual review",
@@ -220,9 +203,10 @@ async def request_refund(
         )
 
     except stripe.StripeError as e:
-        logger.error(f"Stripe refund error: {e}")
+        # SECURITY FIX: Log error details but don't expose to client
+        logger.error(f"Stripe refund error: {e}", exc_info=True)
 
-        # Log failed attempt
+        # Log failed attempt (internal audit - error details OK here)
         audit_log = AuditLog(
             user_id=current_user.id,
             action=AuditAction.REFUND,
@@ -235,10 +219,10 @@ async def request_refund(
         db.add(audit_log)
         await db.commit()
 
-        raise HTTPException(status_code=400, detail=f"Refund failed: {str(e)}")
+        raise HTTPException(status_code=400, detail="Refund processing failed. Please contact support.")
 
 
-@router.get("/status/{refund_id}", response_model=RefundStatus)
+@router.get("/status/{refund_id}", response_model=RefundStatusResponse)
 async def get_refund_status(
     refund_id: str,
     current_user: User = Depends(get_current_user),
@@ -264,7 +248,7 @@ async def get_refund_status(
         # Get refund status from Stripe
         refund = stripe.Refund.retrieve(refund_id)
 
-        return RefundStatus(
+        return RefundStatusResponse(
             refund_id=refund_id,
             status=refund.status,
             amount=abs(transaction.amount_usd),
@@ -273,7 +257,7 @@ async def get_refund_status(
         )
     except stripe.StripeError:
         # Return from database if Stripe fails
-        return RefundStatus(
+        return RefundStatusResponse(
             refund_id=refund_id,
             status=transaction.status or "unknown",
             amount=abs(transaction.amount_usd),
@@ -349,10 +333,11 @@ For disputes or special cases, contact support@actorhub.ai
 # Admin endpoints
 @router.get("/admin/pending")
 async def get_pending_refunds(
-    admin: User = Depends(require_admin),
+    # SECURITY FIX: Granular permission for refund operations
+    admin: User = Depends(require_permission(AdminPermission.READ_REFUNDS)),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get pending refund requests (admin only)"""
+    """Get pending refund requests (requires READ_REFUNDS permission)"""
     query = select(Transaction, User).join(User).where(
         Transaction.type == "REFUND",
         Transaction.status == "PENDING",

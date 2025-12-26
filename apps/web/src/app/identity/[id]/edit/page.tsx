@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useCallback, useEffect } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useDropzone } from 'react-dropzone'
@@ -23,12 +23,14 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/com
 import { Input } from '@/components/ui/input'
 import { identityApi, Identity } from '@/lib/api'
 import { cn } from '@/lib/utils'
+import { getUserFriendlyError } from '@/lib/errors'
 
 interface FormData {
   display_name: string
   bio: string
   category: string
-  is_public: boolean
+  show_in_public_gallery: boolean
+  allow_commercial_use: boolean
   pricing: {
     personal: number
     commercial: number
@@ -71,7 +73,8 @@ export default function IdentityEditPage() {
     display_name: '',
     bio: '',
     category: '',
-    is_public: false,
+    show_in_public_gallery: false,
+    allow_commercial_use: false,
     pricing: {
       personal: 0,
       commercial: 0,
@@ -81,6 +84,9 @@ export default function IdentityEditPage() {
   const [formErrors, setFormErrors] = useState<FormErrors>({})
   const [additionalImages, setAdditionalImages] = useState<File[]>([])
   const [imagePreviews, setImagePreviews] = useState<string[]>([])
+
+  // Ref to track image previews for cleanup
+  const imagePreviewsRef = useRef<string[]>([])
 
   // Fetch identity data
   const {
@@ -100,7 +106,8 @@ export default function IdentityEditPage() {
         display_name: identity.display_name || identity.name || '',
         bio: identity.bio || '',
         category: identity.category || '',
-        is_public: identity.is_public ?? false,
+        show_in_public_gallery: identity.show_in_public_gallery ?? false,
+        allow_commercial_use: identity.allow_commercial_use ?? false,
         pricing: {
           personal: 0,
           commercial: 0,
@@ -110,12 +117,17 @@ export default function IdentityEditPage() {
     }
   }, [identity])
 
-  // Clean up image previews on unmount
+  // Keep ref in sync with state for cleanup
+  useEffect(() => {
+    imagePreviewsRef.current = imagePreviews
+  }, [imagePreviews])
+
+  // Clean up image previews on unmount only
   useEffect(() => {
     return () => {
-      imagePreviews.forEach((url) => URL.revokeObjectURL(url))
+      imagePreviewsRef.current.forEach((url) => URL.revokeObjectURL(url))
     }
-  }, [imagePreviews])
+  }, [])
 
   // Auto-hide notification
   useEffect(() => {
@@ -137,17 +149,11 @@ export default function IdentityEditPage() {
         message: 'Identity updated successfully!',
       })
     },
-    onError: (error: any) => {
-      let errorMessage = 'Failed to update identity'
-      const detail = error.response?.data?.detail
-      if (typeof detail === 'string') {
-        errorMessage = detail
-      } else if (Array.isArray(detail) && detail.length > 0) {
-        errorMessage = detail.map((d: any) => d.msg || d.message || JSON.stringify(d)).join(', ')
-      }
+    onError: (error: unknown) => {
+      const { message } = getUserFriendlyError(error)
       setNotification({
         type: 'error',
-        message: errorMessage,
+        message,
       })
     },
   })
@@ -218,7 +224,8 @@ export default function IdentityEditPage() {
       display_name: formData.display_name,
       bio: formData.bio,
       category: formData.category,
-      is_public: formData.is_public,
+      show_in_public_gallery: formData.show_in_public_gallery,
+      allow_commercial_use: formData.allow_commercial_use,
     })
   }
 
@@ -303,6 +310,7 @@ export default function IdentityEditPage() {
           <button
             onClick={() => setNotification(null)}
             className="ml-2 hover:opacity-80"
+            aria-label="Dismiss notification"
           >
             <X className="w-4 h-4" />
           </button>
@@ -413,24 +421,25 @@ export default function IdentityEditPage() {
             </CardContent>
           </Card>
 
-          {/* Privacy Settings */}
+          {/* Privacy & Marketplace Settings */}
           <Card className="bg-slate-800/50 border-slate-700">
             <CardHeader>
-              <CardTitle className="text-white">Privacy Settings</CardTitle>
-              <CardDescription>Control who can see your identity</CardDescription>
+              <CardTitle className="text-white">Privacy & Marketplace Settings</CardTitle>
+              <CardDescription>Control visibility and commercial options</CardDescription>
             </CardHeader>
-            <CardContent>
+            <CardContent className="space-y-4">
+              {/* Show in Public Gallery / Marketplace */}
               <div className="flex items-center justify-between p-4 rounded-lg bg-slate-900/50">
                 <div className="flex items-center gap-3">
-                  {formData.is_public ? (
+                  {formData.show_in_public_gallery ? (
                     <Eye className="w-5 h-5 text-green-500" />
                   ) : (
                     <EyeOff className="w-5 h-5 text-slate-500" />
                   )}
                   <div>
-                    <p className="font-medium text-white">Public Profile</p>
+                    <p className="font-medium text-white">Show in Marketplace</p>
                     <p className="text-sm text-slate-400">
-                      {formData.is_public
+                      {formData.show_in_public_gallery
                         ? 'Your identity is visible in the marketplace'
                         : 'Your identity is hidden from the marketplace'}
                     </p>
@@ -438,20 +447,68 @@ export default function IdentityEditPage() {
                 </div>
                 <button
                   type="button"
-                  onClick={() => handleChange('is_public', !formData.is_public)}
+                  role="switch"
+                  aria-checked={formData.show_in_public_gallery}
+                  aria-label="Toggle marketplace visibility"
+                  onClick={() => handleChange('show_in_public_gallery', !formData.show_in_public_gallery)}
                   className={cn(
-                    'relative inline-flex h-6 w-11 items-center rounded-full transition-colors',
-                    formData.is_public ? 'bg-green-500' : 'bg-slate-700'
+                    'relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-slate-900',
+                    formData.show_in_public_gallery ? 'bg-green-500' : 'bg-slate-700'
                   )}
                 >
                   <span
                     className={cn(
                       'inline-block h-4 w-4 transform rounded-full bg-white transition-transform',
-                      formData.is_public ? 'translate-x-6' : 'translate-x-1'
+                      formData.show_in_public_gallery ? 'translate-x-6' : 'translate-x-1'
                     )}
                   />
                 </button>
               </div>
+
+              {/* Allow Commercial Use */}
+              <div className="flex items-center justify-between p-4 rounded-lg bg-slate-900/50">
+                <div className="flex items-center gap-3">
+                  <DollarSign className={cn(
+                    "w-5 h-5",
+                    formData.allow_commercial_use ? "text-green-500" : "text-slate-500"
+                  )} />
+                  <div>
+                    <p className="font-medium text-white">Allow Commercial Use</p>
+                    <p className="text-sm text-slate-400">
+                      {formData.allow_commercial_use
+                        ? 'Brands can license your identity for commercial projects'
+                        : 'Your identity cannot be used commercially'}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={formData.allow_commercial_use}
+                  aria-label="Toggle commercial use"
+                  onClick={() => handleChange('allow_commercial_use', !formData.allow_commercial_use)}
+                  className={cn(
+                    'relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-slate-900',
+                    formData.allow_commercial_use ? 'bg-green-500' : 'bg-slate-700'
+                  )}
+                >
+                  <span
+                    className={cn(
+                      'inline-block h-4 w-4 transform rounded-full bg-white transition-transform',
+                      formData.allow_commercial_use ? 'translate-x-6' : 'translate-x-1'
+                    )}
+                  />
+                </button>
+              </div>
+
+              {/* Info message */}
+              {formData.show_in_public_gallery && formData.allow_commercial_use && (
+                <div className="p-3 rounded-lg bg-green-500/10 border border-green-500/20">
+                  <p className="text-sm text-green-400">
+                    Your identity will appear in the marketplace and be available for licensing.
+                  </p>
+                </div>
+              )}
             </CardContent>
           </Card>
 
@@ -478,6 +535,7 @@ export default function IdentityEditPage() {
                         type="button"
                         onClick={() => removeImage(index)}
                         className="absolute -top-2 -right-2 bg-red-500 text-white rounded-full p-1 hover:bg-red-600"
+                        aria-label={`Remove image ${index + 1}`}
                       >
                         <X className="w-3 h-3" />
                       </button>

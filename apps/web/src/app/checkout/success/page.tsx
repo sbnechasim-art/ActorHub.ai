@@ -6,14 +6,19 @@ import Link from 'next/link'
 import { Shield, CheckCircle, Download, ArrowRight, Sparkles } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
+import { useCartStore } from '@/store/cart'
 
 function SuccessContent() {
   const searchParams = useSearchParams()
   const sessionId = searchParams.get('session_id')
+  const { clearCart } = useCartStore()
 
   useEffect(() => {
-    // Optional: Add confetti effect here if library is available
-  }, [])
+    // Clear cart on successful payment
+    clearCart()
+    // Clear the pending cart from session storage
+    sessionStorage.removeItem('pending_checkout_cart')
+  }, [clearCart])
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950">

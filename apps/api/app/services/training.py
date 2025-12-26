@@ -1,12 +1,19 @@
 """
 Training Service
 Actor Pack training pipeline
+
+Features:
+- Resilient API calls with timeout and retry
+- Exponential backoff for long-running operations
+- Circuit breaker for external AI services
+- Progress tracking and status updates
 """
 
 import asyncio
 import base64
 import io
 import os
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -19,15 +26,49 @@ import structlog
 from PIL import Image
 
 from app.core.config import settings
+from app.core.helpers import utc_now  # MEDIUM FIX: Use timezone-aware datetime
+from app.core.resilience import CircuitBreaker, CircuitBreakerConfig, RetryConfig
 from app.services.storage import StorageService
+from app.models.notifications import Notification, NotificationType
 
 logger = structlog.get_logger()
+
+# Circuit breakers for external AI services
+_replicate_circuit = CircuitBreaker(
+    "replicate",
+    CircuitBreakerConfig(failure_threshold=3, timeout=120.0, success_threshold=2)
+)
+_elevenlabs_circuit = CircuitBreaker(
+    "elevenlabs",
+    CircuitBreakerConfig(failure_threshold=3, timeout=60.0, success_threshold=2)
+)
+
+# Retry config for HTTP calls
+HTTP_RETRY_CONFIG = RetryConfig(
+    max_attempts=3,
+    base_delay=2.0,
+    max_delay=30.0,
+    retryable_exceptions=(httpx.TimeoutException, httpx.ConnectError, httpx.HTTPStatusError),
+)
 
 # Thread pool for CPU-bound operations
 _executor = ThreadPoolExecutor(max_workers=4)
 
+# Semaphores to limit concurrent external API calls (prevent resource exhaustion)
+_replicate_semaphore = asyncio.Semaphore(3)  # Max 3 concurrent Replicate trainings
+_elevenlabs_semaphore = asyncio.Semaphore(5)  # Max 5 concurrent ElevenLabs calls
+_storage_semaphore = asyncio.Semaphore(10)  # Max 10 concurrent S3 operations
+
+# Timeout and retry configuration (use settings for configurable values)
+REPLICATE_API_TIMEOUT = 30  # seconds for API calls
+REPLICATE_TRAINING_TIMEOUT = 7200  # 2 hours max for training
+ELEVENLABS_TIMEOUT = 120  # seconds
+HTTP_RETRY_ATTEMPTS = 3
+HTTP_RETRY_DELAY = 2.0  # seconds
+
 # Explicit mock mode flag for quality assessment
-QUALITY_ASSESSMENT_MOCK = os.getenv("QUALITY_ASSESSMENT_MOCK", "true").lower() == "true"
+# Default to false (production mode) - set to true only for testing without face data
+QUALITY_ASSESSMENT_MOCK = os.getenv("QUALITY_ASSESSMENT_MOCK", "false").lower() == "true"
 
 if QUALITY_ASSESSMENT_MOCK:
     logger.warning("=" * 60)
@@ -65,7 +106,7 @@ class TrainingService:
         This is typically called as a background task or Celery job.
         """
         from app.core.database import async_session_maker
-        from app.models.identity import ActorPack, TrainingStatus
+        from app.models.identity import ActorPack, Identity, TrainingStatus
 
         logger.info(f"Starting Actor Pack training: {actor_pack_id}")
 
@@ -76,10 +117,31 @@ class TrainingService:
                 if not actor_pack:
                     raise ValueError(f"Actor Pack not found: {actor_pack_id}")
 
+                # Get identity for user notification
+                identity = await db.get(Identity, actor_pack.identity_id)
+                user_id = identity.user_id if identity else None
+
                 # Update status
                 actor_pack.training_status = TrainingStatus.PROCESSING
-                actor_pack.training_started_at = datetime.utcnow()
+                actor_pack.training_started_at = utc_now()
                 await db.commit()
+
+                # Create "training started" notification
+                if user_id:
+                    notification = Notification(
+                        user_id=user_id,
+                        type=NotificationType.TRAINING,
+                        title="אימון Actor Pack התחיל",
+                        message=f"האימון של {actor_pack.name or 'Actor Pack'} התחיל. זה יכול לקחת 15-30 דקות.",
+                        action_url=f"/dashboard",
+                        extra_data={
+                            "actor_pack_id": str(actor_pack.id),
+                            "training_status": "PROCESSING",
+                            "training_progress": 0,
+                        }
+                    )
+                    db.add(notification)
+                    await db.commit()
 
                 # Step 1: Process images
                 logger.info("Processing training images...")
@@ -131,12 +193,16 @@ class TrainingService:
 
                 # Update actor pack record
                 actor_pack.training_status = TrainingStatus.COMPLETED
-                actor_pack.training_completed_at = datetime.utcnow()
+                actor_pack.training_completed_at = utc_now()
                 actor_pack.training_progress = 100
                 actor_pack.s3_bucket = settings.S3_BUCKET_ACTOR_PACKS
                 actor_pack.s3_key = pack_result["s3_key"]
                 actor_pack.file_size_bytes = pack_result.get("file_size", 0)
                 actor_pack.quality_score = quality_scores["overall"]
+
+                # Save LoRA model URL if available from face model training
+                if face_model and face_model.get("lora_weights_url"):
+                    actor_pack.lora_model_url = face_model["lora_weights_url"]
                 actor_pack.authenticity_score = quality_scores["authenticity"]
                 actor_pack.consistency_score = quality_scores["consistency"]
                 actor_pack.voice_quality_score = quality_scores.get("voice")
@@ -148,6 +214,24 @@ class TrainingService:
                 actor_pack.is_available = True
 
                 await db.commit()
+
+                # Create "training completed" notification
+                if user_id:
+                    notification = Notification(
+                        user_id=user_id,
+                        type=NotificationType.TRAINING,
+                        title="אימון Actor Pack הושלם!",
+                        message=f"האימון של {actor_pack.name or 'Actor Pack'} הושלם בהצלחה. ציון איכות: {quality_scores['overall']}%",
+                        action_url=f"/dashboard",
+                        extra_data={
+                            "actor_pack_id": str(actor_pack.id),
+                            "training_status": "COMPLETED",
+                            "training_progress": 100,
+                            "quality_score": quality_scores["overall"],
+                        }
+                    )
+                    db.add(notification)
+                    await db.commit()
 
                 logger.info(f"Actor Pack training completed: {actor_pack_id}")
 
@@ -162,22 +246,63 @@ class TrainingService:
                 actor_pack.training_status = TrainingStatus.FAILED
                 actor_pack.training_error = str(e)
                 await db.commit()
+
+                # Create "training failed" notification
+                if user_id:
+                    notification = Notification(
+                        user_id=user_id,
+                        type=NotificationType.TRAINING,
+                        title="אימון Actor Pack נכשל",
+                        message=f"האימון של {actor_pack.name or 'Actor Pack'} נכשל. אנא נסה שוב.",
+                        action_url=f"/dashboard",
+                        extra_data={
+                            "actor_pack_id": str(actor_pack.id),
+                            "training_status": "FAILED",
+                            "error": str(e)[:200],
+                        }
+                    )
+                    db.add(notification)
+                    await db.commit()
+
                 raise
 
     async def _process_images(self, image_urls: List[str]) -> Dict:
-        """Download and process training images"""
+        """Download and process training images with retry logic"""
         from app.services.face_recognition import FaceRecognitionService
+
+        # HIGH FIX: Validate image count before starting downloads
+        MIN_IMAGES_REQUIRED = 5
+        MAX_IMAGES_ALLOWED = settings.MAX_TRAINING_IMAGES  # Prevent resource exhaustion
+
+        if not image_urls:
+            raise ValueError("No training images provided")
+
+        if len(image_urls) < MIN_IMAGES_REQUIRED:
+            raise ValueError(
+                f"Not enough images for training. Minimum required: {MIN_IMAGES_REQUIRED}, "
+                f"provided: {len(image_urls)}"
+            )
+
+        if len(image_urls) > MAX_IMAGES_ALLOWED:
+            logger.warning(
+                f"Too many images provided ({len(image_urls)}), limiting to {MAX_IMAGES_ALLOWED}"
+            )
+            image_urls = image_urls[:MAX_IMAGES_ALLOWED]
 
         face_service = FaceRecognitionService()
 
         embeddings = []
         processed_images = []
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(60.0, connect=10.0)
+        ) as client:
             for url in image_urls:
                 try:
-                    response = await client.get(url)
-                    image_bytes = response.content
+                    # Download with retry
+                    image_bytes = await self._download_with_retry(client, url)
+                    if image_bytes is None:
+                        continue
 
                     # Extract embedding
                     embedding = await face_service.extract_embedding(image_bytes)
@@ -189,10 +314,47 @@ class TrainingService:
                     logger.warning(f"Failed to process image {url}: {e}")
                     continue
 
-        if len(embeddings) < 5:
-            raise ValueError("Not enough valid face images for training")
+        if len(embeddings) < MIN_IMAGES_REQUIRED:
+            raise ValueError(
+                f"Not enough valid face images after processing. "
+                f"Need {MIN_IMAGES_REQUIRED}, got {len(embeddings)}. "
+                f"Ensure images contain clear, detectable faces."
+            )
 
         return {"embeddings": embeddings, "images": processed_images, "count": len(embeddings)}
+
+    async def _download_with_retry(
+        self, client: httpx.AsyncClient, url: str, max_attempts: int = 3
+    ) -> Optional[bytes]:
+        """Download file with retry logic"""
+        last_error = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = await client.get(url)
+                response.raise_for_status()
+                return response.content
+            except (httpx.TimeoutException, httpx.ConnectError) as e:
+                last_error = e
+                if attempt < max_attempts:
+                    delay = HTTP_RETRY_CONFIG.base_delay * (2 ** (attempt - 1))
+                    logger.warning(
+                        f"Download attempt {attempt}/{max_attempts} failed, retrying in {delay}s",
+                        url=url[:50],
+                        error=str(e),
+                    )
+                    await asyncio.sleep(delay)
+            except httpx.HTTPStatusError as e:
+                # Don't retry 4xx errors
+                if 400 <= e.response.status_code < 500:
+                    logger.warning(f"Download failed with client error: {e}")
+                    return None
+                last_error = e
+                if attempt < max_attempts:
+                    delay = HTTP_RETRY_CONFIG.base_delay * (2 ** (attempt - 1))
+                    await asyncio.sleep(delay)
+
+        logger.error(f"Download failed after {max_attempts} attempts: {last_error}")
+        return None
 
     async def _train_face_model(self, face_data: Dict) -> Dict:
         """
@@ -294,70 +456,155 @@ class TrainingService:
 
             logger.info(f"Starting Replicate LoRA training for {training_id}")
 
-            # Initialize Replicate client
-            client = replicate.Client(api_token=settings.REPLICATE_API_TOKEN)
+            # Check circuit breaker before attempting
+            if not _replicate_circuit.can_execute():
+                logger.warning("Replicate circuit breaker is OPEN, skipping LoRA training")
+                return None
 
-            # Run training in thread pool to avoid blocking
-            loop = asyncio.get_event_loop()
+            # Use semaphore to limit concurrent Replicate trainings
+            async with _replicate_semaphore:
+                try:
+                    # Use async HTTP client for Replicate API (non-blocking)
+                    lora_weights_url = await self._run_replicate_training_async(
+                        training_id=training_id,
+                        images_url=images_url,
+                    )
 
-            def run_training():
-                # Create training job using Flux LoRA trainer
-                training = client.trainings.create(
-                    version="ostris/flux-dev-lora-trainer:d995297071a44dcb72244e6c19462111649ec86a9ff7e6b69a77b18e5e95cf41",
-                    input={
+                    if lora_weights_url:
+                        _replicate_circuit.record_success()
+                        logger.info(f"LoRA training completed: {lora_weights_url}")
+                    else:
+                        _replicate_circuit.record_failure()
+
+                    return lora_weights_url
+                except Exception as e:
+                    _replicate_circuit.record_failure()
+                    raise
+
+        except Exception as e:
+            logger.error(f"LoRA training error: {e}")
+            return None
+
+    async def _run_replicate_training_async(
+        self,
+        training_id: str,
+        images_url: str,
+    ) -> Optional[str]:
+        """
+        Run Replicate training with async polling (non-blocking).
+
+        Uses httpx async client instead of blocking sync client to avoid
+        thread pool exhaustion during long-running training jobs.
+        """
+        replicate_api_base = "https://api.replicate.com/v1"
+        headers = {
+            "Authorization": f"Token {settings.REPLICATE_API_TOKEN}",
+            "Content-Type": "application/json",
+        }
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+            # Step 1: Create training job
+            # HIGH FIX: Using configurable model version instead of hardcoded value
+            create_response = await client.post(
+                f"{replicate_api_base}/models/ostris/flux-dev-lora-trainer/versions/"
+                f"{settings.REPLICATE_LORA_TRAINER_VERSION}/trainings",
+                headers=headers,
+                json={
+                    "destination": f"{settings.REPLICATE_USERNAME}/shilo-v1",
+                    "input": {
                         "input_images": images_url,
-                        "trigger_word": f"person_{training_id}",
+                        "trigger_word": "SHILO",
                         "steps": 1000,
                         "lora_rank": 16,
                         "learning_rate": 0.0004,
                         "batch_size": 1,
                         "resolution": "512,768,1024",
                         "autocaption": True,
-                        "autocaption_prefix": f"a photo of person_{training_id}",
+                        "autocaption_prefix": "a photo of SHILO",
                     },
-                    destination=f"actorhub/{training_id}"
+                },
+            )
+
+            if create_response.status_code not in (200, 201):
+                logger.error(
+                    "Failed to create Replicate training",
+                    status=create_response.status_code,
+                    response=create_response.text[:500],
                 )
+                return None
 
-                # Poll for completion (with timeout)
-                max_wait = 3600  # 1 hour max
-                start_time = datetime.utcnow()
+            training_data = create_response.json()
+            training_url = training_data.get("urls", {}).get("get")
 
-                while training.status not in ["succeeded", "failed", "canceled"]:
-                    import time
-                    time.sleep(30)  # Check every 30 seconds
-                    training.reload()
+            if not training_url:
+                logger.error("No training URL in Replicate response")
+                return None
 
-                    elapsed = (datetime.utcnow() - start_time).total_seconds()
-                    if elapsed > max_wait:
-                        logger.warning(f"LoRA training timeout after {elapsed}s")
+            logger.info(
+                "Replicate training created",
+                training_id=training_id,
+                replicate_id=training_data.get("id"),
+            )
+
+            # Step 2: Async polling with exponential backoff (NON-BLOCKING!)
+            start_time = time.time()
+            poll_delay = settings.REPLICATE_POLL_INITIAL_DELAY
+            poll_count = 0
+
+            while True:
+                # Non-blocking sleep - does NOT hold thread pool thread
+                await asyncio.sleep(poll_delay)
+                poll_count += 1
+
+                try:
+                    status_response = await client.get(training_url, headers=headers)
+                    if status_response.status_code != 200:
+                        logger.warning(
+                            "Failed to poll training status",
+                            status=status_response.status_code,
+                        )
+                        continue
+
+                    status_data = status_response.json()
+                    status = status_data.get("status")
+
+                    elapsed = time.time() - start_time
+                    logger.info(
+                        f"LoRA training status: {status}",
+                        elapsed=f"{elapsed:.0f}s",
+                        poll_delay=poll_delay,
+                        poll_count=poll_count,
+                    )
+
+                    if status == "succeeded":
+                        output = status_data.get("output")
+                        if output and isinstance(output, dict) and "weights" in output:
+                            return output["weights"]
+                        elif output and isinstance(output, str):
+                            return output
+                        logger.warning(f"Training succeeded but no weights URL: {output}")
                         return None
 
-                    logger.info(f"LoRA training status: {training.status} ({elapsed:.0f}s elapsed)")
+                    if status in ("failed", "canceled"):
+                        error = status_data.get("error", "Unknown error")
+                        logger.error(f"LoRA training failed: {status} - {error}")
+                        return None
 
-                if training.status == "succeeded":
-                    # Get the output model URL
-                    output = training.output
-                    if output and "weights" in output:
-                        return output["weights"]
-                    elif output and isinstance(output, str):
-                        return output
+                    # Check timeout
+                    if elapsed > REPLICATE_TRAINING_TIMEOUT:
+                        logger.warning(
+                            f"LoRA training timeout after {elapsed:.0f}s",
+                            training_id=training_id,
+                            polls=poll_count,
+                        )
+                        return None
 
-                    logger.warning(f"Training succeeded but no weights URL in output: {output}")
-                    return None
-                else:
-                    logger.error(f"LoRA training failed: {training.status} - {training.error}")
-                    return None
+                    # Exponential backoff with cap
+                    poll_delay = min(poll_delay * 1.5, settings.REPLICATE_POLL_MAX_DELAY)
 
-            lora_weights_url = await loop.run_in_executor(_executor, run_training)
-
-            if lora_weights_url:
-                logger.info(f"LoRA training completed: {lora_weights_url}")
-
-            return lora_weights_url
-
-        except Exception as e:
-            logger.error(f"LoRA training error: {e}")
-            return None
+                except httpx.HTTPError as e:
+                    logger.warning(f"HTTP error polling training status: {e}")
+                    # Continue polling despite transient errors
 
     async def _train_voice_model(self, audio_urls: List[str]) -> Optional[Dict]:
         """
@@ -397,7 +644,7 @@ class TrainingService:
         """
         Train voice using Coqui XTTS via Replicate.
 
-        Uses the cjwbw/xtts-v2 model for voice cloning.
+        Uses the lucataco/xtts-v2 model for voice cloning.
         """
         try:
             import replicate
@@ -405,16 +652,19 @@ class TrainingService:
             logger.warning("replicate package not installed")
             return None
 
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            # Download and merge audio files
+        # Check circuit breaker
+        if not _replicate_circuit.can_execute():
+            logger.warning("Replicate circuit breaker is OPEN, skipping XTTS training")
+            return None
+
+        timeout = httpx.Timeout(ELEVENLABS_TIMEOUT, connect=10.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            # Download and merge audio files with retry
             audio_samples = []
             for url in audio_urls[:5]:  # Limit to 5 samples
-                try:
-                    response = await client.get(url)
-                    audio_samples.append(response.content)
-                except Exception as e:
-                    logger.warning(f"Failed to download audio {url}: {e}")
-                    continue
+                audio_bytes = await self._download_with_retry(client, url)
+                if audio_bytes:
+                    audio_samples.append(audio_bytes)
 
             if not audio_samples:
                 return None
@@ -443,9 +693,9 @@ class TrainingService:
             def run_xtts():
                 client = replicate.Client(api_token=settings.REPLICATE_API_TOKEN)
 
-                # Use XTTS-v2 for voice cloning
+                # HIGH FIX: Use configurable XTTS version instead of hardcoded
                 output = client.run(
-                    "cjwbw/xtts-v2:79a125f5ab49aa10e39eddd06cc10ed3a708f8eb01d04e30369a4c342c619bc5",
+                    f"lucataco/xtts-v2:{settings.REPLICATE_XTTS_VERSION}",
                     input={
                         "speaker_wav": audio_url,
                         "text": "This is a voice cloning test to verify the quality.",
@@ -456,6 +706,7 @@ class TrainingService:
 
             try:
                 output = await loop.run_in_executor(_executor, run_xtts)
+                _replicate_circuit.record_success()
 
                 return {
                     "provider": "xtts",
@@ -464,6 +715,7 @@ class TrainingService:
                     "status": "ready",
                 }
             except Exception as e:
+                _replicate_circuit.record_failure()
                 logger.error(f"XTTS Replicate error: {e}")
                 return None
 
@@ -475,11 +727,13 @@ class TrainingService:
         """
         stored_keys = []
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        timeout = httpx.Timeout(60.0, connect=10.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
             for i, url in enumerate(audio_urls[:10]):  # Limit to 10 files
                 try:
-                    response = await client.get(url)
-                    audio_bytes = response.content
+                    audio_bytes = await self._download_with_retry(client, url)
+                    if not audio_bytes:
+                        continue
 
                     key = f"voice-references/{uuid.uuid4().hex}/sample_{i}.wav"
                     await self.storage.upload_file(
@@ -502,33 +756,71 @@ class TrainingService:
         }
 
     async def _train_voice_elevenlabs(self, audio_urls: List[str]) -> Dict:
-        """Train voice using ElevenLabs API"""
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            # Download audio files
-            audio_files = []
-            for url in audio_urls:
-                response = await client.get(url)
-                audio_files.append(response.content)
+        """Train voice using ElevenLabs API with circuit breaker and retry"""
+        # Check circuit breaker
+        if not _elevenlabs_circuit.can_execute():
+            raise Exception("ElevenLabs circuit breaker is OPEN")
 
-            # Create voice clone
-            # Note: ElevenLabs requires specific format for the API
-            # This is a simplified version
-            response = await client.post(
-                "https://api.elevenlabs.io/v1/voices/add",
-                headers={"xi-api-key": settings.ELEVENLABS_API_KEY},
-                files=[("files", audio) for audio in audio_files],
-                data={"name": f"ActorHub_{uuid.uuid4().hex[:8]}"},
-            )
+        # Use semaphore to limit concurrent ElevenLabs calls
+        async with _elevenlabs_semaphore:
+            timeout = httpx.Timeout(ELEVENLABS_TIMEOUT, connect=10.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                # Download audio files with retry
+                audio_files = []
+                for url in audio_urls:
+                    audio_bytes = await self._download_with_retry(client, url)
+                    if audio_bytes:
+                        audio_files.append(audio_bytes)
 
-            if response.status_code == 200:
-                voice_data = response.json()
-                return {
-                    "provider": "elevenlabs",
-                    "voice_id": voice_data.get("voice_id"),
-                    "status": "ready",
-                }
+                if not audio_files:
+                    raise Exception("No audio files could be downloaded")
 
-            raise Exception(f"ElevenLabs API error: {response.text}")
+                # Create voice clone with retry
+                last_error = None
+                for attempt in range(1, HTTP_RETRY_ATTEMPTS + 1):
+                    try:
+                        response = await client.post(
+                            "https://api.elevenlabs.io/v1/voices/add",
+                            headers={"xi-api-key": settings.ELEVENLABS_API_KEY},
+                            files=[("files", audio) for audio in audio_files],
+                            data={"name": f"ActorHub_{uuid.uuid4().hex[:8]}"},
+                        )
+
+                        if response.status_code == 200:
+                            _elevenlabs_circuit.record_success()
+                            voice_data = response.json()
+                            return {
+                                "provider": "elevenlabs",
+                                "voice_id": voice_data.get("voice_id"),
+                                "status": "ready",
+                            }
+
+                        # Handle rate limiting
+                        if response.status_code == 429:
+                            retry_after = int(response.headers.get("Retry-After", 30))
+                            logger.warning(f"ElevenLabs rate limited, waiting {retry_after}s")
+                            await asyncio.sleep(retry_after)
+                            continue
+
+                        # Don't retry client errors
+                        if 400 <= response.status_code < 500:
+                            _elevenlabs_circuit.record_failure()
+                            raise Exception(f"ElevenLabs API error: {response.text}")
+
+                        last_error = Exception(f"ElevenLabs API error: {response.status_code}")
+
+                    except httpx.TimeoutException as e:
+                        last_error = e
+                        logger.warning(f"ElevenLabs timeout attempt {attempt}/{HTTP_RETRY_ATTEMPTS}")
+                    except httpx.ConnectError as e:
+                        last_error = e
+                        logger.warning(f"ElevenLabs connection error attempt {attempt}/{HTTP_RETRY_ATTEMPTS}")
+
+                    if attempt < HTTP_RETRY_ATTEMPTS:
+                        await asyncio.sleep(HTTP_RETRY_DELAY * attempt)
+
+                _elevenlabs_circuit.record_failure()
+                raise Exception(f"ElevenLabs API failed after {HTTP_RETRY_ATTEMPTS} attempts: {last_error}")
 
     async def _extract_motion(self, video_urls: List[str]) -> Optional[Dict]:
         """
@@ -566,12 +858,15 @@ class TrainingService:
             all_pose_sequences = []
             processed_videos = 0
 
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            timeout = httpx.Timeout(180.0, connect=10.0)  # 3 min for video download
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 for video_url in video_urls:
                     try:
-                        # Download video
-                        response = await client.get(video_url)
-                        video_bytes = response.content
+                        # Download video with retry
+                        video_bytes = await self._download_with_retry(client, video_url)
+                        if not video_bytes:
+                            logger.warning(f"Could not download video: {video_url[:50]}")
+                            continue
 
                         # Save temporarily for OpenCV processing
                         import tempfile
@@ -731,7 +1026,7 @@ class TrainingService:
             manifest = {
                 "version": "1.0.0",
                 "actor_pack_id": actor_pack_id,
-                "created_at": datetime.utcnow().isoformat(),
+                "created_at": utc_now().isoformat(),
                 "components": {
                     "face": True,
                     "voice": voice_model is not None,

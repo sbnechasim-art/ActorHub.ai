@@ -1,8 +1,12 @@
 """
 Request Logging Middleware
 Structured logging for all API requests with PII filtering
+
+In DEBUG mode: logs full request/response bodies for development
+In PRODUCTION: logs only metadata with PII filtering
 """
 
+import json
 import re
 import time
 import uuid
@@ -12,6 +16,13 @@ import structlog
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
+
+# Import settings to check DEBUG mode
+try:
+    from app.core.config import settings
+    DEBUG_MODE = settings.DEBUG
+except:
+    DEBUG_MODE = True  # Default to debug in development
 
 logger = structlog.get_logger()
 
@@ -88,6 +99,9 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
     """
     Logs all API requests with structured data.
 
+    DEBUG MODE: Full request/response body logging for development
+    PRODUCTION: Metadata only with PII filtering
+
     Logged data:
     - Request ID (for tracing)
     - Method and path
@@ -96,6 +110,8 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
     - Response status
     - Response time
     - User ID (if authenticated)
+    - Request body (DEBUG only)
+    - Response body (DEBUG only)
     """
 
     # Paths to exclude from logging
@@ -104,8 +120,17 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
     # Headers to redact
     SENSITIVE_HEADERS = {"authorization", "x-api-key", "cookie"}
 
+    # Content types to log body for
+    LOGGABLE_CONTENT_TYPES = {"application/json", "application/x-www-form-urlencoded", "text/plain"}
+
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        # Skip logging for excluded paths
+        # Always print to console in DEBUG mode for visibility
+        if DEBUG_MODE:
+            print(f"\n{'='*60}")
+            print(f"🔵 {request.method} {request.url.path}")
+            print(f"{'='*60}", flush=True)
+
+        # Skip detailed logging for health/metrics paths
         if request.url.path in self.EXCLUDE_PATHS:
             return await call_next(request)
 
@@ -126,33 +151,64 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         # Start timing
         start_time = time.perf_counter()
 
-        # Log request
-        logger.info(
-            "request_started",
-            request_id=request_id,
-            method=request.method,
-            path=request.url.path,
-            query=str(request.query_params) if request.query_params else None,
-            client_ip=client_ip,
-            user_agent=request.headers.get("user-agent"),
-        )
+        # Read request body in DEBUG mode
+        request_body = None
+        if DEBUG_MODE and request.method in ("POST", "PUT", "PATCH"):
+            try:
+                body_bytes = await request.body()
+                content_type = request.headers.get("content-type", "")
+                if any(ct in content_type for ct in self.LOGGABLE_CONTENT_TYPES):
+                    try:
+                        request_body = json.loads(body_bytes.decode("utf-8"))
+                        # Sanitize sensitive fields
+                        request_body = sanitize_dict(request_body)
+                    except:
+                        request_body = body_bytes.decode("utf-8", errors="replace")[:500]
+                elif "multipart" in content_type:
+                    request_body = f"[MULTIPART FORM DATA - {len(body_bytes)} bytes]"
+            except:
+                request_body = "[COULD NOT READ BODY]"
+
+        # Log request with body in DEBUG mode
+        log_data = {
+            "request_id": request_id,
+            "method": request.method,
+            "path": request.url.path,
+            "query": str(request.query_params) if request.query_params else None,
+            "client_ip": client_ip,
+            "user_agent": request.headers.get("user-agent"),
+        }
+
+        if DEBUG_MODE:
+            log_data["headers"] = {
+                k: "[REDACTED]" if k.lower() in self.SENSITIVE_HEADERS else v
+                for k, v in request.headers.items()
+            }
+            if request_body:
+                log_data["body"] = request_body
+
+        logger.info(">>> REQUEST", **log_data)
 
         # Process request
         try:
             response = await call_next(request)
         except Exception as e:
-            # Log error
+            # Log error with full traceback in DEBUG mode
             duration = time.perf_counter() - start_time
-            logger.error(
-                "request_error",
-                request_id=request_id,
-                method=request.method,
-                path=request.url.path,
-                client_ip=client_ip,
-                duration_ms=round(duration * 1000, 2),
-                error=str(e),
-                error_type=type(e).__name__,
-            )
+            error_data = {
+                "request_id": request_id,
+                "method": request.method,
+                "path": request.url.path,
+                "client_ip": client_ip,
+                "duration_ms": round(duration * 1000, 2),
+                "error": str(e),
+                "error_type": type(e).__name__,
+            }
+            if DEBUG_MODE:
+                import traceback
+                error_data["traceback"] = traceback.format_exc()
+
+            logger.error("!!! REQUEST ERROR", **error_data)
             raise
 
         # Calculate duration
@@ -161,6 +217,31 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         # Get user ID if authenticated
         user_id = getattr(request.state, "user_id", None)
 
+        # Read response body in DEBUG mode for error responses
+        response_body = None
+        if DEBUG_MODE and response.status_code >= 400:
+            # We need to read and rebuild the response to log the body
+            try:
+                response_body_bytes = b""
+                async for chunk in response.body_iterator:
+                    response_body_bytes += chunk
+
+                try:
+                    response_body = json.loads(response_body_bytes.decode("utf-8"))
+                except:
+                    response_body = response_body_bytes.decode("utf-8", errors="replace")[:1000]
+
+                # Rebuild response with the body we consumed
+                from starlette.responses import Response as StarletteResponse
+                response = StarletteResponse(
+                    content=response_body_bytes,
+                    status_code=response.status_code,
+                    headers=dict(response.headers),
+                    media_type=response.media_type,
+                )
+            except Exception as e:
+                response_body = f"[COULD NOT READ RESPONSE: {e}]"
+
         # Log response
         log_level = (
             "info"
@@ -168,17 +249,29 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             else ("warning" if response.status_code < 500 else "error")
         )
 
-        getattr(logger, log_level)(
-            "request_completed",
-            request_id=request_id,
-            method=request.method,
-            path=request.url.path,
-            status_code=response.status_code,
-            duration_ms=round(duration * 1000, 2),
-            client_ip=client_ip,
-            user_id=user_id,
-            response_size=response.headers.get("content-length"),
-        )
+        response_log = {
+            "request_id": request_id,
+            "method": request.method,
+            "path": request.url.path,
+            "status_code": response.status_code,
+            "duration_ms": round(duration * 1000, 2),
+            "client_ip": client_ip,
+            "user_id": user_id,
+            "response_size": response.headers.get("content-length"),
+        }
+
+        if DEBUG_MODE and response_body:
+            response_log["body"] = response_body
+
+        status_emoji = "✅" if response.status_code < 400 else ("⚠️" if response.status_code < 500 else "❌")
+        getattr(logger, log_level)(f"<<< RESPONSE {status_emoji}", **response_log)
+
+        # Print summary in DEBUG mode
+        if DEBUG_MODE:
+            print(f"🟢 {response.status_code} | {round(duration * 1000, 2)}ms | {request.method} {request.url.path}")
+            if response_body:
+                print(f"📦 Response: {response_body}")
+            print(flush=True)
 
         # Add request ID to response headers
         response.headers["X-Request-ID"] = request_id
