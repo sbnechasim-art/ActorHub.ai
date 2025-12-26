@@ -9,7 +9,7 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1
 
 // Debug: Log API URL on initialization
 if (typeof window !== 'undefined') {
-  console.log('[API Client] Initialized with baseURL:', API_URL)
+  if (process.env.NODE_ENV === 'development') console.log('[API Client] Initialized with baseURL:', API_URL)
 }
 
 export const api = axios.create({
@@ -143,15 +143,33 @@ export interface Payout {
   completed_at?: string
 }
 
+// Helper to get cookie value
+function getCookie(name: string): string | null {
+  if (typeof document === 'undefined') return null
+  const value = `; ${document.cookie}`
+  const parts = value.split(`; ${name}=`)
+  if (parts.length === 2) return parts.pop()?.split(';').shift() || null
+  return null
+}
+
 // Request interceptor - cookies are sent automatically via withCredentials
-// No need to manually add Authorization header for browser clients
+// CSRF token must be read from cookie and sent in header
 api.interceptors.request.use((config) => {
-  // Debug: Log all outgoing requests
   if (typeof window !== 'undefined') {
-    console.log('[API Request]', config.method?.toUpperCase(), config.baseURL + config.url, config.params)
+    // Debug logging only in development
+    if (process.env.NODE_ENV === 'development') {
+      console.debug('[API Request]', config.method?.toUpperCase(), config.url)
+    }
+
+    // Add CSRF token for state-changing requests (POST, PUT, PATCH, DELETE)
+    const method = config.method?.toUpperCase()
+    if (method && ['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
+      const csrfToken = getCookie('_csrf')
+      if (csrfToken) {
+        config.headers['X-CSRF-Token'] = csrfToken
+      }
+    }
   }
-  // For server-side rendering or API key usage, token can be set manually
-  // But for browser clients, httpOnly cookies are used automatically
   return config
 })
 
@@ -374,6 +392,25 @@ export const subscriptionsApi = {
     api.post('/subscriptions/cancel').then((r) => r.data),
   reactivate: () =>
     api.post('/subscriptions/reactivate').then((r) => r.data),
+  // Get Stripe portal URL for subscription management
+  getPortalUrl: () =>
+    api.post<{ url: string }>('/subscriptions/portal').then((r) => r.data),
+}
+
+// 2FA Authentication API
+export const twoFactorApi = {
+  // Start 2FA setup - returns QR code and secret
+  enable: () =>
+    api.post<{ secret: string; qr_code: string; backup_codes: string[] }>('/auth/2fa/enable').then((r) => r.data),
+  // Verify 2FA code to complete setup
+  verify: (code: string) =>
+    api.post('/auth/2fa/verify', { code }).then((r) => r.data),
+  // Disable 2FA
+  disable: (code: string) =>
+    api.post('/auth/2fa/disable', { code }).then((r) => r.data),
+  // Get 2FA status
+  getStatus: () =>
+    api.get<{ enabled: boolean; backup_codes_remaining: number }>('/auth/2fa/status').then((r) => r.data),
 }
 
 export interface CreatorEarning {

@@ -130,15 +130,53 @@ export default function RegisterIdentityPage() {
     }
   })
 
-  const onDropFace = useCallback((files: File[]) => {
-    if (files[0]) setFaceImage(files[0])
+  // Allowed image types and max file size (10MB)
+  const ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp']
+  const MAX_FILE_SIZE = 10 * 1024 * 1024
+
+  const onDropFace = useCallback((acceptedFiles: File[], rejectedFiles: any[]) => {
+    // Handle rejected files
+    if (rejectedFiles.length > 0) {
+      const rejection = rejectedFiles[0]
+      if (rejection.errors?.some((e: any) => e.code === 'file-too-large')) {
+        setValidationErrors(prev => ({ ...prev, faceImage: 'Image must be less than 10MB' }))
+      } else if (rejection.errors?.some((e: any) => e.code === 'file-invalid-type')) {
+        setValidationErrors(prev => ({ ...prev, faceImage: 'Only JPG, PNG, and WebP images are allowed' }))
+      }
+      return
+    }
+
+    // Validate accepted file
+    const file = acceptedFiles[0]
+    if (file) {
+      // Clear previous errors
+      setValidationErrors(prev => ({ ...prev, faceImage: '' }))
+
+      // Additional validation
+      if (!ALLOWED_IMAGE_TYPES.includes(file.type)) {
+        setValidationErrors(prev => ({ ...prev, faceImage: 'Invalid image type' }))
+        return
+      }
+      if (file.size > MAX_FILE_SIZE) {
+        setValidationErrors(prev => ({ ...prev, faceImage: 'Image must be less than 10MB' }))
+        return
+      }
+
+      setFaceImage(file)
+    }
   }, [])
 
   const faceDropzone = useDropzone({
     onDrop: onDropFace,
-    accept: { 'image/*': ['.jpg', '.jpeg', '.png'] },
+    accept: { 'image/*': ['.jpg', '.jpeg', '.png', '.webp'] },
     maxFiles: 1,
-    maxSize: 10 * 1024 * 1024
+    maxSize: MAX_FILE_SIZE,
+    validator: (file) => {
+      if (!ALLOWED_IMAGE_TYPES.includes(file.type)) {
+        return { code: 'file-invalid-type', message: 'Invalid file type' }
+      }
+      return null
+    }
   })
 
   // Handle selfie capture from camera

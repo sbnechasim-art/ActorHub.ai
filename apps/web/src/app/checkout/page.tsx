@@ -31,7 +31,7 @@ export default function CheckoutPage() {
     setError(null)
 
     try {
-      // Map tier names to valid license types (lowercase for Pydantic validation)
+      // Map tier names to valid license types
       const getLicenseType = (tierName: string) => {
         switch (tierName.toLowerCase()) {
           case 'basic': return 'single_use'
@@ -41,7 +41,7 @@ export default function CheckoutPage() {
         }
       }
 
-      // For each item, create a purchase request
+      // Create purchase requests with item tracking
       const purchasePromises = items.map(async (item) => {
         const response = await marketplaceApi.purchaseLicense({
           identity_id: item.identityId,
@@ -49,21 +49,43 @@ export default function CheckoutPage() {
           usage_type: item.tierName === 'Basic' ? 'personal' : 'commercial',
           duration_days: item.tierName === 'Enterprise' ? 365 : item.tierName === 'Pro' ? 90 : 30,
         })
-        return response
+        return { item, response }
       })
 
-      const results = await Promise.all(purchasePromises)
+      // Use allSettled to handle partial failures gracefully
+      const results = await Promise.allSettled(purchasePromises)
 
-      // Get the first checkout URL (in a real app, you'd batch these)
-      const checkoutUrl = results[0]?.checkout_url
+      // Separate successful and failed purchases
+      const successful: Array<{ item: typeof items[0]; response: { checkout_url?: string } }> = []
+      const failed: string[] = []
+
+      results.forEach((result, index) => {
+        if (result.status === 'fulfilled') {
+          successful.push(result.value)
+        } else {
+          failed.push(items[index].actorName)
+          removeItem(items[index].id)
+        }
+      })
+
+      // Handle complete failure
+      if (successful.length === 0) {
+        throw new Error('All purchases failed. Please try again later.')
+      }
+
+      // Warn about partial failures
+      if (failed.length > 0) {
+        logger.warn('Partial checkout failure', { failed })
+      }
+
+      // Get checkout URL from first successful result
+      const checkoutUrl = successful[0]?.response?.checkout_url
 
       if (checkoutUrl) {
-        // Store cart in sessionStorage before redirect (in case user comes back)
-        sessionStorage.setItem('pending_checkout_cart', JSON.stringify(items))
-        // Redirect to Stripe - cart will be cleared on success page
+        // Store only successful items before redirect
+        sessionStorage.setItem('pending_checkout_cart', JSON.stringify(successful.map(s => s.item)))
         window.location.href = checkoutUrl
       } else {
-        // No checkout URL - payment system not configured
         throw new Error('Payment system temporarily unavailable. Please try again later.')
       }
     } catch (err: unknown) {

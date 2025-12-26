@@ -43,10 +43,25 @@ class CSRFMiddleware(BaseHTTPMiddleware):
     UNSAFE_METHODS: Set[str] = {"POST", "PUT", "PATCH", "DELETE"}
 
     # Endpoints exempt from CSRF (webhooks use signature verification)
+    # Auth endpoints are exempt because:
+    # 1. User isn't authenticated yet (no session to hijack)
+    # 2. Credentials themselves provide protection
     EXEMPT_PATHS: Set[str] = {
         "/api/v1/webhooks/stripe",
         "/api/v1/webhooks/clerk",
         "/api/v1/webhooks/replicate",
+        "/api/v1/users/login",
+        "/api/v1/users/register",
+        "/api/v1/users/refresh",
+        "/api/v1/users/forgot-password",
+        "/api/v1/users/reset-password",
+        "/api/v1/auth/login",
+        "/api/v1/auth/register",
+        "/api/v1/auth/refresh",
+        "/api/v1/auth/google",
+        "/api/v1/auth/google/callback",
+        "/api/v1/auth/github",
+        "/api/v1/auth/github/callback",
     }
 
     async def dispatch(self, request: Request, call_next):

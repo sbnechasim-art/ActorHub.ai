@@ -23,7 +23,7 @@ import {
   ExternalLink,
   QrCode,
 } from 'lucide-react'
-import { userApi, notificationsApi, subscriptionsApi } from '@/lib/api'
+import { userApi, notificationsApi, subscriptionsApi, twoFactorApi } from '@/lib/api'
 import { logger } from '@/lib/logger'
 
 interface ApiKey {
@@ -177,29 +177,27 @@ export default function SettingsPage() {
 
   // Enable 2FA mutation
   const enable2FAMutation = useMutation({
-    mutationFn: () => fetch('/api/v1/auth/2fa/enable', {
-      method: 'POST',
-      credentials: 'include',
-    }).then(r => r.json()),
+    mutationFn: twoFactorApi.enable,
     onSuccess: (data) => {
       setTwoFASecret(data)
       setShow2FASetup(true)
+    },
+    onError: (error: Error) => {
+      console.error('Failed to enable 2FA:', error.message)
     },
   })
 
   // Verify 2FA mutation
   const verify2FAMutation = useMutation({
-    mutationFn: (code: string) => fetch('/api/v1/auth/2fa/verify', {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code }),
-    }).then(r => r.json()),
+    mutationFn: twoFactorApi.verify,
     onSuccess: () => {
       setShow2FASetup(false)
       setTwoFACode('')
       setTwoFASecret(null)
       queryClient.invalidateQueries({ queryKey: ['user-profile'] })
+    },
+    onError: (error: Error) => {
+      console.error('Failed to verify 2FA code:', error.message)
     },
   })
 
@@ -244,14 +242,14 @@ export default function SettingsPage() {
 
   // Manage subscription mutation (opens Stripe portal)
   const manageSubscriptionMutation = useMutation({
-    mutationFn: () => fetch('/api/v1/subscriptions/portal', {
-      method: 'POST',
-      credentials: 'include',
-    }).then(r => r.json()),
+    mutationFn: subscriptionsApi.getPortalUrl,
     onSuccess: (data) => {
       if (data.url) {
         window.open(data.url, '_blank')
       }
+    },
+    onError: (error: Error) => {
+      console.error('Failed to open subscription portal:', error.message)
     },
   })
 
